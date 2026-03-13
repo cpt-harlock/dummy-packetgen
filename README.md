@@ -21,7 +21,7 @@ ninja -C build
 The app needs at least **2 lcores** (one for TX on main, one for RX on a worker):
 
 ```bash
-sudo ./build/packetgenlatency -l 0-1 -n 4 -- 
+sudo ./build/packetgenlatency -l 0-1 -n 4 -- --payload-len 64 --range
 ```
 
 Common EAL options:
@@ -42,13 +42,22 @@ sudo ./build/packetgenlatency -l 0-1 -n 4 \
 
 Press **Ctrl-C** to stop; the app prints TX/RX totals on exit.
 
+### App options
+
+| Flag | Description |
+|------|-------------|
+| `--pps N` | Target TX rate in packets per second (`0` = line rate) |
+| `--payload-len N` | UDP payload size in bytes (default `64`) |
+| `--range` | Change the last 2 bytes of the destination IPv4 address for each packet |
+| `--debug` | Hex-dump received packets and parsed timestamp fields |
+
 ## Dummy packet format
 
 | Layer | Details |
 |-------|---------|
 | Ethernet | Src `00:AA:BB:CC:DD:EE` → Dst `00:11:22:33:44:55`, EtherType IPv4 |
-| IPv4 | `10.0.0.1` → `10.0.0.2`, TTL 64 |
+| IPv4 | `10.0.0.1` → `10.0.0.2`, TTL 64; with `--range`, the last 2 bytes of the destination IP increment per packet |
 | UDP | Src port `12345` → Dst port `54321` |
-| Payload | 64 bytes, incrementing pattern |
+| Payload | Configurable length (default 64 bytes), incrementing pattern |
 
-Edit the `#define` constants at the top of `main.c` to customise addresses, ports, or payload size.
+Edit the `#define` constants at the top of `main.c` to customise addresses or ports.

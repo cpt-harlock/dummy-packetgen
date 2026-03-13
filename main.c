@@ -4,6 +4,8 @@
  */
 
 #include <getopt.h>
+#include <limits.h>
+#include <locale.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -34,17 +36,24 @@
 #define DST_IP    RTE_IPV4(10, 0, 0, 2)
 #define SRC_PORT  12345
 #define DST_PORT  54321
-#define PAYLOAD_LEN 64
+#define DEFAULT_PAYLOAD_LEN 64
+#define MAX_PAYLOAD_LEN (UINT16_MAX - sizeof(struct rte_ipv4_hdr) - sizeof(struct rte_udp_hdr))
 
 /* Histogram parameters */
 #define HIST_NUM_BINS  1000
 #define HIST_BIN_WIDTH 1       /* latency units per bin */
 
 static volatile int keep_running = 1;
-static struct rte_mempool *mbuf_pool;
+static struct rte_mempool *rx_mbuf_pool;
+static struct rte_mempool *tx_mbuf_pool;
 
 /* 0 = unlimited (line rate) */
 static uint64_t target_pps;
+static uint16_t payload_len = DEFAULT_PAYLOAD_LEN;
+static int range_mode;
+
+/* Packet size used when preloading TX mbuf data buffers. */
+static uint16_t template_pkt_len;
 
 /* Debug mode: dump raw bytes of each received packet */
 static int debug_mode;
@@ -136,7 +145,7 @@ static int port_init(uint16_t port)
 		return ret;
 
 	ret = rte_eth_rx_queue_setup(port, 0, nb_rxd,
-			rte_eth_dev_socket_id(port), NULL, mbuf_pool);
+			rte_eth_dev_socket_id(port), NULL, rx_mbuf_pool);
 	if (ret < 0)
 		return ret;
 
@@ -158,24 +167,22 @@ static int port_init(uint16_t port)
 	return 0;
 }
 
-/* Build a dummy UDP/IP/Ethernet packet inside an mbuf. */
-static struct rte_mbuf *build_dummy_packet(void)
+static uint32_t next_dst_ip(uint64_t packet_index)
 {
-	struct rte_mbuf *m = rte_pktmbuf_alloc(mbuf_pool);
-	if (m == NULL)
-		return NULL;
+	uint32_t base_prefix = DST_IP & 0xffff0000u;
+	uint32_t base_host = DST_IP & 0x0000ffffu;
+	uint32_t host_part;
 
-	/* Total sizes */
-	uint16_t pkt_data_len = sizeof(struct rte_ether_hdr) +
-				sizeof(struct rte_ipv4_hdr)  +
-				sizeof(struct rte_udp_hdr)   +
-				PAYLOAD_LEN;
+	if (!range_mode)
+		return DST_IP;
 
-	m->data_len = pkt_data_len;
-	m->pkt_len  = pkt_data_len;
+	host_part = (base_host + (uint32_t)packet_index) & 0x0000ffffu;
+	return base_prefix | host_part;
+}
 
-	char *pkt = rte_pktmbuf_mtod(m, char *);
-	memset(pkt, 0, pkt_data_len);
+static void init_packet_bytes(char *pkt)
+{
+	memset(pkt, 0, template_pkt_len);
 
 	/* --- Ethernet header --- */
 	struct rte_ether_hdr *eth = (struct rte_ether_hdr *)pkt;
@@ -191,7 +198,7 @@ static struct rte_mbuf *build_dummy_packet(void)
 	ip->type_of_service  = 0;
 	ip->total_length     = rte_cpu_to_be_16(sizeof(*ip) +
 						 sizeof(struct rte_udp_hdr) +
-						 PAYLOAD_LEN);
+						 payload_len);
 	ip->packet_id        = 0;
 	ip->fragment_offset  = 0;
 	ip->time_to_live     = 64;
@@ -205,15 +212,82 @@ static struct rte_mbuf *build_dummy_packet(void)
 	struct rte_udp_hdr *udp = (struct rte_udp_hdr *)((char *)ip + sizeof(*ip));
 	udp->src_port    = rte_cpu_to_be_16(SRC_PORT);
 	udp->dst_port    = rte_cpu_to_be_16(DST_PORT);
-	udp->dgram_len   = rte_cpu_to_be_16(sizeof(*udp) + PAYLOAD_LEN);
+	udp->dgram_len   = rte_cpu_to_be_16(sizeof(*udp) + payload_len);
 	udp->dgram_cksum = 0;
 
 	/* --- Payload (fill with a pattern) --- */
 	uint8_t *payload = (uint8_t *)udp + sizeof(*udp);
-	for (int i = 0; i < PAYLOAD_LEN; i++)
+	for (uint16_t i = 0; i < payload_len; i++)
 		payload[i] = (uint8_t)(i & 0xff);
 
-	return m;
+	return;
+}
+
+/* Preload every TX mbuf data buffer once so the hot path avoids memcpy. */
+static int preload_tx_pool(void)
+{
+	unsigned int max_mbufs = rte_mempool_avail_count(tx_mbuf_pool);
+	struct rte_mbuf **bufs;
+	unsigned int count = 0;
+
+	template_pkt_len = sizeof(struct rte_ether_hdr) +
+			   sizeof(struct rte_ipv4_hdr)  +
+			   sizeof(struct rte_udp_hdr)   +
+			   payload_len;
+
+	bufs = calloc(max_mbufs, sizeof(*bufs));
+	if (bufs == NULL)
+		return -1;
+
+	for (;;) {
+		struct rte_mbuf *m = rte_pktmbuf_alloc(tx_mbuf_pool);
+		if (m == NULL)
+			break;
+
+		init_packet_bytes(rte_pktmbuf_mtod(m, char *));
+		bufs[count++] = m;
+	}
+
+	for (unsigned int i = 0; i < count; i++)
+		rte_pktmbuf_free(bufs[i]);
+
+	free(bufs);
+	return count > 0 ? 0 : -1;
+
+	return 0;
+}
+
+/*
+ * Copy the template into a pre-allocated mbuf and, in range mode,
+ * patch the destination IP and recompute the IPv4 checksum.
+ */
+inline static void fill_packet(struct rte_mbuf *m, uint32_t dst_ip)
+{
+	m->data_len = template_pkt_len;
+	m->pkt_len  = template_pkt_len;
+
+	if (range_mode) {
+		char *pkt = rte_pktmbuf_mtod(m, char *);
+		struct rte_ipv4_hdr *ip = (struct rte_ipv4_hdr *)
+					  (pkt + sizeof(struct rte_ether_hdr));
+		ip->dst_addr     = rte_cpu_to_be_32(dst_ip);
+		ip->hdr_checksum = rte_ipv4_cksum(ip);
+	}
+}
+
+static int parse_payload_len(const char *arg, uint16_t *value)
+{
+	char *end = NULL;
+	unsigned long parsed;
+
+	parsed = strtoul(arg, &end, 10);
+	if (arg[0] == '\0' || end == arg || *end != '\0')
+		return -1;
+	if (parsed > MAX_PAYLOAD_LEN)
+		return -1;
+
+	*value = (uint16_t)parsed;
+	return 0;
 }
 
 /* RX loop: runs on a secondary lcore. */
@@ -319,6 +393,7 @@ static void tx_loop(uint16_t port)
 {
 	struct rte_mbuf *bufs[BURST_SIZE];
 	uint64_t tx_total = 0;
+	uint64_t packet_index = 0;
 	uint64_t last_print = rte_rdtsc();
 	uint64_t hz = rte_get_tsc_hz();
 
@@ -348,19 +423,14 @@ static void tx_loop(uint16_t port)
 			next_send += ticks_per_burst;
 		}
 
-		/* Build a burst of identical dummy packets */
+		/* Pre-allocate the entire burst in one pool dequeue */
+		if (rte_pktmbuf_alloc_bulk(tx_mbuf_pool, bufs, BURST_SIZE) < 0)
+			goto stats;
+
+		/* Fill each mbuf from the template, patching per-packet fields */
 		for (int i = 0; i < BURST_SIZE; i++) {
-			bufs[i] = build_dummy_packet();
-			if (bufs[i] == NULL) {
-				/* Couldn't allocate; send what we have */
-				if (i == 0)
-					continue;
-				uint16_t sent = rte_eth_tx_burst(port, 0, bufs, i);
-				for (uint16_t j = sent; j < i; j++)
-					rte_pktmbuf_free(bufs[j]);
-				tx_total += sent;
-				goto stats;
-			}
+			fill_packet(bufs[i], next_dst_ip(packet_index));
+			packet_index++;
 		}
 
 		uint16_t sent = rte_eth_tx_burst(port, 0, bufs, BURST_SIZE);
@@ -373,21 +443,23 @@ stats:
 		{
 			uint64_t now = rte_rdtsc();
 			if (now - last_print >= hz) {
-				printf("[TX] Sent %"PRIu64" total packets\n", tx_total);
+				printf("[TX] Sent %'lu total packets\n", tx_total);
 				last_print = now;
 			}
 		}
 	}
 
-	printf("[TX] Total packets sent: %"PRIu64"\n", tx_total);
+	printf("[TX] Total packets sent: %'lu\n", tx_total);
 }
 
 static void usage(const char *prog)
 {
-	printf("Usage: %s [EAL options] -- [--pps <packets/sec>] [--debug]\n"
+	printf("Usage: %s [EAL options] -- [--pps <packets/sec>] [--payload-len <bytes>] [--range] [--debug]\n"
 	       "  --pps N   Target TX rate in packets per second (0 = line rate, default)\n"
+	       "  --payload-len N   UDP payload size in bytes (default: %u, max: %u)\n"
+	       "  --range   Vary the destination IPv4 low 16 bits for each packet\n"
 	       "  --debug   Hex-dump received packets up to the timestamp fields\n",
-	       prog);
+	       prog, DEFAULT_PAYLOAD_LEN, (unsigned int)MAX_PAYLOAD_LEN);
 }
 
 int main(int argc, char *argv[])
@@ -396,6 +468,8 @@ int main(int argc, char *argv[])
 	uint16_t port_id = 0;
 	uint16_t nb_ports;
 	unsigned int lcore_id;
+    
+	setlocale(LC_NUMERIC, ""); // Usa locale di sistema per i separatori
 
 	/* --- EAL init --- */
 	ret = rte_eal_init(argc, argv);
@@ -406,17 +480,28 @@ int main(int argc, char *argv[])
 
 	/* --- Parse app-specific options (after "--") --- */
 	static struct option long_options[] = {
-		{"pps",   required_argument, NULL, 'p'},
-		{"debug", no_argument,       NULL, 'd'},
-		{"help",  no_argument,       NULL, 'h'},
-		{NULL,    0,                 NULL,  0 }
+		{"pps",         required_argument, NULL, 'p'},
+		{"payload-len", required_argument, NULL, 's'},
+		{"range",       no_argument,       NULL, 'r'},
+		{"debug",       no_argument,       NULL, 'd'},
+		{"help",        no_argument,       NULL, 'h'},
+		{NULL,           0,                 NULL,  0 }
 	};
 
 	int opt;
-	while ((opt = getopt_long(argc, argv, "p:dh", long_options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "p:s:rdh", long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'p':
 			target_pps = strtoull(optarg, NULL, 10);
+			break;
+		case 's':
+			if (parse_payload_len(optarg, &payload_len) != 0)
+				rte_exit(EXIT_FAILURE,
+					 "Invalid payload length '%s' (expected 0-%u)\n",
+					 optarg, (unsigned int)MAX_PAYLOAD_LEN);
+			break;
+		case 'r':
+			range_mode = 1;
 			break;
 		case 'd':
 			debug_mode = 1;
@@ -436,15 +521,30 @@ int main(int argc, char *argv[])
 		rte_exit(EXIT_FAILURE, "No Ethernet ports available\n");
 
 	printf("Using port %u (of %u available)\n", port_id, nb_ports);
+	printf("Configured UDP payload length: %u bytes\n", payload_len);
+	printf("Destination IP range mode: %s\n",
+	       range_mode ? "enabled (varying low 16 bits)" : "disabled");
 
-	/* --- Create mbuf pool --- */
-	mbuf_pool = rte_pktmbuf_pool_create("MBUF_POOL", NUM_MBUFS * nb_ports,
-					     MBUF_CACHE, 0,
-					     RTE_MBUF_DEFAULT_BUF_SIZE,
-					     rte_socket_id());
-	if (mbuf_pool == NULL)
-		rte_exit(EXIT_FAILURE, "Cannot create mbuf pool: %s\n",
+	/* --- Create RX/TX mbuf pools --- */
+	rx_mbuf_pool = rte_pktmbuf_pool_create("RX_MBUF_POOL", NUM_MBUFS * nb_ports,
+						MBUF_CACHE, 0,
+						RTE_MBUF_DEFAULT_BUF_SIZE,
+						rte_socket_id());
+	if (rx_mbuf_pool == NULL)
+		rte_exit(EXIT_FAILURE, "Cannot create RX mbuf pool: %s\n",
 			 rte_strerror(rte_errno));
+
+	tx_mbuf_pool = rte_pktmbuf_pool_create("TX_MBUF_POOL", NUM_MBUFS * nb_ports,
+						MBUF_CACHE, 0,
+						RTE_MBUF_DEFAULT_BUF_SIZE,
+						rte_socket_id());
+	if (tx_mbuf_pool == NULL)
+		rte_exit(EXIT_FAILURE, "Cannot create TX mbuf pool: %s\n",
+			 rte_strerror(rte_errno));
+
+	/* --- Preload TX mbufs with the packet contents --- */
+	if (preload_tx_pool() != 0)
+		rte_exit(EXIT_FAILURE, "Cannot preload TX mbuf pool\n");
 
 	/* --- Initialise port --- */
 	ret = port_init(port_id);
