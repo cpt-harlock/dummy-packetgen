@@ -46,6 +46,9 @@ static struct rte_mempool *mbuf_pool;
 /* 0 = unlimited (line rate) */
 static uint64_t target_pps;
 
+/* Debug mode: dump raw bytes of each received packet */
+static int debug_mode;
+
 /* Global histogram – filled by the RX lcore, read after join. */
 static uint64_t hist_bins[HIST_NUM_BINS];
 static uint64_t hist_overflow;          /* counts above the last bin */
@@ -247,11 +250,31 @@ static int rx_loop(__rte_unused void *arg)
 			/* Need at least 47 bytes to read both timestamps */
 			if (rte_pktmbuf_data_len(m) >= 47) {
 				uint8_t *pkt = rte_pktmbuf_mtod(m, uint8_t *);
+
+				if (debug_mode) {
+					printf("[RX-DBG] pkt #%"PRIu64" (%u bytes) "
+					       "first 47 bytes:\n",
+					       rx_total, rte_pktmbuf_data_len(m));
+					for (int b = 0; b < 47; b++) {
+						printf("%02x ", pkt[b]);
+						if ((b & 0xf) == 0xf)
+							printf("\n");
+					}
+					printf("\n");
+				}
+
 				uint32_t rx_timestamp;
 				uint32_t tx_timestamp;
 				memcpy(&rx_timestamp, pkt + 39, sizeof(uint32_t));
 				memcpy(&tx_timestamp, pkt + 43, sizeof(uint32_t));
 				uint32_t latency = tx_timestamp - rx_timestamp;
+
+				if (debug_mode) {
+					printf("[RX-DBG]   rx_ts=%u (off 39)  "
+					       "tx_ts=%u (off 43)  "
+					       "latency=%u\n",
+					       rx_timestamp, tx_timestamp, latency);
+				}
 
 				lat_sum += latency;
 				lat_count++;
@@ -361,8 +384,9 @@ stats:
 
 static void usage(const char *prog)
 {
-	printf("Usage: %s [EAL options] -- [--pps <packets/sec>]\n"
-	       "  --pps N   Target TX rate in packets per second (0 = line rate, default)\n",
+	printf("Usage: %s [EAL options] -- [--pps <packets/sec>] [--debug]\n"
+	       "  --pps N   Target TX rate in packets per second (0 = line rate, default)\n"
+	       "  --debug   Hex-dump received packets up to the timestamp fields\n",
 	       prog);
 }
 
@@ -382,16 +406,20 @@ int main(int argc, char *argv[])
 
 	/* --- Parse app-specific options (after "--") --- */
 	static struct option long_options[] = {
-		{"pps",  required_argument, NULL, 'p'},
-		{"help", no_argument,       NULL, 'h'},
-		{NULL,   0,                 NULL,  0 }
+		{"pps",   required_argument, NULL, 'p'},
+		{"debug", no_argument,       NULL, 'd'},
+		{"help",  no_argument,       NULL, 'h'},
+		{NULL,    0,                 NULL,  0 }
 	};
 
 	int opt;
-	while ((opt = getopt_long(argc, argv, "p:h", long_options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "p:dh", long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'p':
 			target_pps = strtoull(optarg, NULL, 10);
+			break;
+		case 'd':
+			debug_mode = 1;
 			break;
 		case 'h':
 		default:
