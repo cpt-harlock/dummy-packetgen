@@ -3,6 +3,7 @@
  * Sends a fixed dummy UDP packet at line rate and prints received packets.
  */
 
+#include <getopt.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -35,8 +36,65 @@
 #define DST_PORT  54321
 #define PAYLOAD_LEN 64
 
+/* Histogram parameters */
+#define HIST_NUM_BINS  1000
+#define HIST_BIN_WIDTH 1       /* latency units per bin */
+
 static volatile int keep_running = 1;
 static struct rte_mempool *mbuf_pool;
+
+/* 0 = unlimited (line rate) */
+static uint64_t target_pps;
+
+/* Global histogram – filled by the RX lcore, read after join. */
+static uint64_t hist_bins[HIST_NUM_BINS];
+static uint64_t hist_overflow;          /* counts above the last bin */
+static uint64_t hist_total;
+static uint32_t hist_global_min;
+static uint32_t hist_global_max;
+
+static void hist_record(uint32_t latency)
+{
+	uint32_t bin = latency / HIST_BIN_WIDTH;
+	if (bin < HIST_NUM_BINS)
+		hist_bins[bin]++;
+	else
+		hist_overflow++;
+	hist_total++;
+
+	if (latency < hist_global_min)
+		hist_global_min = latency;
+	if (latency > hist_global_max)
+		hist_global_max = latency;
+}
+
+static void hist_dump(const char *filename)
+{
+	FILE *f = fopen(filename, "w");
+	if (!f) {
+		printf("Failed to open %s for writing\n", filename);
+		return;
+	}
+
+	fprintf(f, "bin_start,bin_end,count\n");
+	for (uint32_t i = 0; i < HIST_NUM_BINS; i++) {
+		if (hist_bins[i] == 0)
+			continue;
+		fprintf(f, "%u,%u,%" PRIu64 "\n",
+			i * HIST_BIN_WIDTH,
+			(i + 1) * HIST_BIN_WIDTH,
+			hist_bins[i]);
+	}
+	if (hist_overflow > 0)
+		fprintf(f, "%u,inf,%" PRIu64 "\n",
+			HIST_NUM_BINS * HIST_BIN_WIDTH, hist_overflow);
+	fclose(f);
+
+	printf("[HIST] %" PRIu64 " samples written to %s  "
+	       "(min=%u max=%u overflow=%" PRIu64 ")\n",
+	       hist_total, filename,
+	       hist_global_min, hist_global_max, hist_overflow);
+}
 
 static void signal_handler(int sig)
 {
@@ -164,6 +222,16 @@ static int rx_loop(__rte_unused void *arg)
 	uint64_t last_print = rte_rdtsc();
 	uint64_t hz = rte_get_tsc_hz();
 
+	/* Latency tracking (reset every print interval) */
+	uint64_t lat_sum = 0;
+	uint64_t lat_count = 0;
+	uint32_t lat_min = UINT32_MAX;
+	uint32_t lat_max = 0;
+
+	/* Initialise global histogram bounds */
+	hist_global_min = UINT32_MAX;
+	hist_global_max = 0;
+
 	printf("[RX] Running on lcore %u\n", rte_lcore_id());
 
 	while (keep_running) {
@@ -173,16 +241,50 @@ static int rx_loop(__rte_unused void *arg)
 
 		rx_total += nb_rx;
 
+		for (uint16_t i = 0; i < nb_rx; i++) {
+			struct rte_mbuf *m = bufs[i];
+
+			/* Need at least 47 bytes to read both timestamps */
+			if (rte_pktmbuf_data_len(m) >= 47) {
+				uint8_t *pkt = rte_pktmbuf_mtod(m, uint8_t *);
+				uint32_t rx_timestamp;
+				uint32_t tx_timestamp;
+				memcpy(&rx_timestamp, pkt + 39, sizeof(uint32_t));
+				memcpy(&tx_timestamp, pkt + 43, sizeof(uint32_t));
+				uint32_t latency = tx_timestamp - rx_timestamp;
+
+				lat_sum += latency;
+				lat_count++;
+				if (latency < lat_min)
+					lat_min = latency;
+				if (latency > lat_max)
+					lat_max = latency;
+
+				/* Record in global histogram */
+				hist_record(latency);
+			}
+
+			rte_pktmbuf_free(m);
+		}
+
 		/* Print a summary every second */
 		uint64_t now = rte_rdtsc();
 		if (now - last_print >= hz) {
-			printf("[RX] Received %"PRIu64" total packets\n", rx_total);
+			if (lat_count > 0) {
+				printf("[RX] total=%"PRIu64"  interval_pkts=%"PRIu64
+				       "  latency min=%u avg=%"PRIu64" max=%u\n",
+				       rx_total, lat_count,
+				       lat_min, lat_sum / lat_count, lat_max);
+			} else {
+				printf("[RX] total=%"PRIu64"  (no timestamped packets)\n",
+				       rx_total);
+			}
 			last_print = now;
+			lat_sum = 0;
+			lat_count = 0;
+			lat_min = UINT32_MAX;
+			lat_max = 0;
 		}
-
-		/* Free received mbufs */
-		for (uint16_t i = 0; i < nb_rx; i++)
-			rte_pktmbuf_free(bufs[i]);
 	}
 
 	printf("[RX] Total packets received: %"PRIu64"\n", rx_total);
@@ -197,9 +299,32 @@ static void tx_loop(uint16_t port)
 	uint64_t last_print = rte_rdtsc();
 	uint64_t hz = rte_get_tsc_hz();
 
+	/*
+	 * Rate-limiting: if target_pps > 0, compute the TSC ticks
+	 * to wait between each burst so that the average rate matches.
+	 */
+	uint64_t ticks_per_burst = 0;
+	if (target_pps > 0) {
+		ticks_per_burst = hz * BURST_SIZE / target_pps;
+		printf("[TX] Rate-limiting to %" PRIu64 " pps "
+		       "(burst interval ~%" PRIu64 " ticks)\n",
+		       target_pps, ticks_per_burst);
+	} else {
+		printf("[TX] Sending at line rate (no pps limit)\n");
+	}
+
 	printf("[TX] Running on lcore %u\n", rte_lcore_id());
 
+	uint64_t next_send = rte_rdtsc();
+
 	while (keep_running) {
+		/* Pace: wait until it's time to send the next burst */
+		if (ticks_per_burst > 0) {
+			while (rte_rdtsc() < next_send && keep_running)
+				;
+			next_send += ticks_per_burst;
+		}
+
 		/* Build a burst of identical dummy packets */
 		for (int i = 0; i < BURST_SIZE; i++) {
 			bufs[i] = build_dummy_packet();
@@ -234,6 +359,13 @@ stats:
 	printf("[TX] Total packets sent: %"PRIu64"\n", tx_total);
 }
 
+static void usage(const char *prog)
+{
+	printf("Usage: %s [EAL options] -- [--pps <packets/sec>]\n"
+	       "  --pps N   Target TX rate in packets per second (0 = line rate, default)\n",
+	       prog);
+}
+
 int main(int argc, char *argv[])
 {
 	int ret;
@@ -247,6 +379,26 @@ int main(int argc, char *argv[])
 		rte_exit(EXIT_FAILURE, "EAL init failed\n");
 	argc -= ret;
 	argv += ret;
+
+	/* --- Parse app-specific options (after "--") --- */
+	static struct option long_options[] = {
+		{"pps",  required_argument, NULL, 'p'},
+		{"help", no_argument,       NULL, 'h'},
+		{NULL,   0,                 NULL,  0 }
+	};
+
+	int opt;
+	while ((opt = getopt_long(argc, argv, "p:h", long_options, NULL)) != -1) {
+		switch (opt) {
+		case 'p':
+			target_pps = strtoull(optarg, NULL, 10);
+			break;
+		case 'h':
+		default:
+			usage(argv[0]);
+			return 0;
+		}
+	}
 
 	signal(SIGINT,  signal_handler);
 	signal(SIGTERM, signal_handler);
@@ -292,6 +444,9 @@ int main(int argc, char *argv[])
 	RTE_LCORE_FOREACH_WORKER(lcore_id) {
 		rte_eal_wait_lcore(lcore_id);
 	}
+
+	/* --- Dump latency histogram --- */
+	hist_dump("latency_histogram.csv");
 
 	/* --- Cleanup --- */
 	rte_eth_dev_stop(port_id);
