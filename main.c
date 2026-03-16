@@ -21,13 +21,16 @@
 #include <rte_launch.h>
 #include <rte_lcore.h>
 #include <rte_mbuf.h>
+#include <rte_ring.h>
 #include <rte_udp.h>
 
-#define RX_RING_SIZE 1024
-#define TX_RING_SIZE 1024
-#define NUM_MBUFS    8191
-#define MBUF_CACHE   250
-#define BURST_SIZE   32
+#define RX_RING_SIZE    1024
+#define TX_RING_SIZE    1024
+#define NUM_MBUFS       8191
+#define MBUF_CACHE      250
+#define BURST_SIZE      64     /* larger bursts amortise per-burst overhead */
+#define PREFETCH_OFFSET  3     /* prefetch this many packets ahead */
+#define WORK_RING_SIZE  4096   /* per-queue SPSC ring depth; must be power of 2 */
 
 /* Dummy packet parameters */
 #define DST_MAC   {0x00, 0x11, 0x22, 0x33, 0x44, 0x55}
@@ -45,6 +48,14 @@
 
 /* Maximum number of RX queues / worker lcores */
 #define MAX_RX_QUEUES  16
+
+/*
+ * Pipeline mode: one IO lcore drains the NIC into a per-queue SPSC ring;
+ * a paired worker lcore dequeues, processes, and frees packets.  Enabled
+ * automatically when at least two worker lcores are available per queue.
+ */
+static struct rte_ring *work_rings[MAX_RX_QUEUES];
+static int pipeline_mode;
 
 /* Per-RX-queue context: packet counter and per-lcore histogram. */
 struct rx_ctx {
@@ -393,7 +404,15 @@ static int rx_loop(void *arg)
 
 		ctx->rx_total += nb_rx;
 
+		/* Prime the prefetch pipeline for the first packets in the burst. */
+		for (uint16_t i = 0; i < RTE_MIN(nb_rx, (uint16_t)PREFETCH_OFFSET); i++)
+			rte_prefetch0(rte_pktmbuf_mtod(bufs[i], void *));
+
 		for (uint16_t i = 0; i < nb_rx; i++) {
+			/* Prefetch packet data for a future iteration. */
+			if (i + PREFETCH_OFFSET < nb_rx)
+				rte_prefetch0(rte_pktmbuf_mtod(bufs[i + PREFETCH_OFFSET], void *));
+
 			struct rte_mbuf *m = bufs[i];
 
 			/* Need at least 47 bytes to read both timestamps */
@@ -445,9 +464,10 @@ static int rx_loop(void *arg)
 				if (latency > ctx->hist_max)
 					ctx->hist_max = latency;
 			}
-
-			rte_pktmbuf_free(m);
 		}
+
+		for (uint16_t i = 0; i < nb_rx; i++)
+			rte_pktmbuf_free(bufs[i]);
 
 		/* Print a summary every second */
 		uint64_t now = rte_rdtsc();
@@ -469,6 +489,152 @@ static int rx_loop(void *arg)
 	}
 
 	printf("[RX] q%u total packets received: %'lu\n", queue, ctx->rx_total);
+	return 0;
+}
+
+/* -----------------------------------------------------------------------
+ * Pipeline mode: IO lcore + worker lcore per queue
+ * -----------------------------------------------------------------------
+ * The IO lcore's only job is to drain the NIC as fast as possible and
+ * push mbufs into the per-queue SPSC ring.  Keeping this lcore free of
+ * any packet inspection means it can sustain line-rate bursts without
+ * jitter from processing work.
+ *
+ * The worker lcore dequeues from the ring, processes timestamps/histogram,
+ * and bulk-frees the burst — completely off the NIC polling critical path.
+ */
+
+static int io_lcore(void *arg)
+{
+	struct rx_ctx *ctx = arg;
+	uint16_t queue = ctx->queue_id;
+	struct rte_ring *ring = work_rings[queue];
+	struct rte_mbuf *bufs[BURST_SIZE];
+
+	printf("[IO] lcore %u draining queue %u → ring\n", rte_lcore_id(), queue);
+
+	while (keep_running) {
+		uint16_t nb_rx = rte_eth_rx_burst(0, queue, bufs, BURST_SIZE);
+		if (nb_rx == 0)
+			continue;
+
+		uint16_t nb_enq = rte_ring_enqueue_burst(ring, (void **)bufs,
+							  nb_rx, NULL);
+		/* Drop any packets that couldn't fit — ring is full (back-pressure). */
+		for (uint16_t i = nb_enq; i < nb_rx; i++)
+			rte_pktmbuf_free(bufs[i]);
+	}
+	return 0;
+}
+
+static int worker_lcore(void *arg)
+{
+	struct rx_ctx *ctx = arg;
+	uint16_t queue = ctx->queue_id;
+	struct rte_ring *ring = work_rings[queue];
+	struct rte_mbuf *bufs[BURST_SIZE];
+	uint64_t last_print = rte_rdtsc();
+	uint64_t hz = rte_get_tsc_hz();
+
+	uint64_t lat_sum = 0;
+	uint64_t lat_count = 0;
+	uint32_t lat_min = UINT32_MAX;
+	uint32_t lat_max = 0;
+
+	if (latency_mode) {
+		ctx->hist_min = UINT32_MAX;
+		ctx->hist_max = 0;
+	}
+
+	printf("[WORKER] lcore %u processing queue %u\n", rte_lcore_id(), queue);
+
+	/* Drain the ring even after keep_running clears so we don't leak mbufs. */
+	while (keep_running || rte_ring_count(ring) > 0) {
+		uint16_t nb = rte_ring_dequeue_burst(ring, (void **)bufs,
+						     BURST_SIZE, NULL);
+		if (nb == 0)
+			continue;
+
+		ctx->rx_total += nb;
+
+		/* Prime the prefetch pipeline. */
+		for (uint16_t i = 0; i < RTE_MIN(nb, (uint16_t)PREFETCH_OFFSET); i++)
+			rte_prefetch0(rte_pktmbuf_mtod(bufs[i], void *));
+
+		for (uint16_t i = 0; i < nb; i++) {
+			if (i + PREFETCH_OFFSET < nb)
+				rte_prefetch0(rte_pktmbuf_mtod(bufs[i + PREFETCH_OFFSET],
+							       void *));
+
+			struct rte_mbuf *m = bufs[i];
+
+			if (latency_mode && rte_pktmbuf_data_len(m) >= 47) {
+				uint8_t *pkt = rte_pktmbuf_mtod(m, uint8_t *);
+
+				if (debug_mode) {
+					printf("[RX-DBG] q%u pkt #%"PRIu64" (%u bytes) "
+					       "first 47 bytes:\n",
+					       queue, ctx->rx_total,
+					       rte_pktmbuf_data_len(m));
+					for (int b = 0; b < 47; b++) {
+						printf("%02x ", pkt[b]);
+						if ((b & 0xf) == 0xf)
+							printf("\n");
+					}
+					printf("\n");
+				}
+
+				uint32_t rx_timestamp;
+				uint32_t tx_timestamp;
+				memcpy(&rx_timestamp, pkt + 39, sizeof(uint32_t));
+				memcpy(&tx_timestamp, pkt + 43, sizeof(uint32_t));
+				uint32_t latency = tx_timestamp - rx_timestamp;
+
+				if (debug_mode) {
+					printf("[RX-DBG]   rx_ts=%u (off 39)  "
+					       "tx_ts=%u (off 43)  "
+					       "latency=%u\n",
+					       rx_timestamp, tx_timestamp, latency);
+				}
+
+				lat_sum += latency;
+				lat_count++;
+				if (latency < lat_min) lat_min = latency;
+				if (latency > lat_max) lat_max = latency;
+
+				uint32_t bin = latency / HIST_BIN_WIDTH;
+				if (bin < HIST_NUM_BINS)
+					ctx->hist_bins[bin]++;
+				else
+					ctx->hist_overflow++;
+				ctx->hist_total++;
+				if (latency < ctx->hist_min) ctx->hist_min = latency;
+				if (latency > ctx->hist_max) ctx->hist_max = latency;
+			}
+		}
+
+		for (uint16_t i = 0; i < nb; i++)
+			rte_pktmbuf_free(bufs[i]);
+
+		uint64_t now = rte_rdtsc();
+		if (now - last_print >= hz) {
+			if (latency_mode && lat_count > 0) {
+				printf("[WORKER] q%u total=%'lu  interval_pkts=%"PRIu64
+				       "  latency min=%u avg=%"PRIu64" max=%u\n",
+				       queue, ctx->rx_total, lat_count,
+				       lat_min, lat_sum / lat_count, lat_max);
+			} else {
+				printf("[WORKER] q%u total=%'lu\n", queue, ctx->rx_total);
+			}
+			last_print = now;
+			lat_sum = 0;
+			lat_count = 0;
+			lat_min = UINT32_MAX;
+			lat_max = 0;
+		}
+	}
+
+	printf("[WORKER] q%u total packets processed: %'lu\n", queue, ctx->rx_total);
 	return 0;
 }
 
@@ -656,15 +822,23 @@ int main(int argc, char *argv[])
 	printf("Latency / histogram tracking: %s\n",
 	       latency_mode ? "enabled" : "disabled");
 
-	/* Determine how many RX queues/lcores to use */
-	nb_rx_queues = 0;
+	/* Collect all worker lcores; decide pipeline vs single-lcore mode. */
+	uint16_t nb_worker_lcores = 0;
+	unsigned int worker_lcores[MAX_RX_QUEUES * 2];
 	RTE_LCORE_FOREACH_WORKER(lcore_id) {
-		nb_rx_queues++;
-		if (nb_rx_queues == MAX_RX_QUEUES)
-			break;
+		if (nb_worker_lcores < MAX_RX_QUEUES * 2)
+			worker_lcores[nb_worker_lcores++] = lcore_id;
 	}
-	if (nb_rx_queues == 0)
-		nb_rx_queues = 1;
+
+	if (nb_worker_lcores >= 2) {
+		/* Pipeline mode: one IO lcore + one worker lcore per queue. */
+		pipeline_mode = 1;
+		nb_rx_queues = nb_worker_lcores / 2;
+	} else {
+		nb_rx_queues = nb_worker_lcores > 0 ? nb_worker_lcores : 1;
+	}
+	if (nb_rx_queues > MAX_RX_QUEUES)
+		nb_rx_queues = MAX_RX_QUEUES;
 
 	/* --- Create RX/TX mbuf pools --- */
 	rx_mbuf_pool = rte_pktmbuf_pool_create("RX_MBUF_POOL", NUM_MBUFS * nb_ports,
@@ -699,20 +873,38 @@ int main(int argc, char *argv[])
 		rx_ctxs[q].queue_id = q;
 	printf("Using %u RX queue(s)\n", nb_rx_queues);
 
-	/* --- Launch one RX lcore per queue --- */
-	{
-		uint16_t q = 0;
-		RTE_LCORE_FOREACH_WORKER(lcore_id) {
-			if (q >= nb_rx_queues)
-				break;
-			rte_eal_remote_launch(rx_loop, &rx_ctxs[q], lcore_id);
-			q++;
+	/* --- Launch RX lcores --- */
+	if (pipeline_mode) {
+		/*
+		 * Pipeline: for each queue, launch an IO lcore (NIC drain only)
+		 * and a worker lcore (packet processing).  Two lcores per queue.
+		 */
+		for (uint16_t q = 0; q < nb_rx_queues; q++) {
+			char ring_name[32];
+			snprintf(ring_name, sizeof(ring_name), "work_ring_%u", q);
+			work_rings[q] = rte_ring_create(ring_name, WORK_RING_SIZE,
+							rte_socket_id(),
+							RING_F_SP_ENQ | RING_F_SC_DEQ);
+			if (work_rings[q] == NULL)
+				rte_exit(EXIT_FAILURE,
+					 "Cannot create work ring %u: %s\n",
+					 q, rte_strerror(rte_errno));
+
+			rte_eal_remote_launch(io_lcore,     &rx_ctxs[q], worker_lcores[q * 2]);
+			rte_eal_remote_launch(worker_lcore, &rx_ctxs[q], worker_lcores[q * 2 + 1]);
 		}
-		if (q == 0)
+		printf("Pipeline mode: launched %u queue(s) × (1 IO + 1 worker) lcore\n",
+		       nb_rx_queues);
+	} else {
+		/* Single-lcore mode (optimised rx_loop with prefetch). */
+		for (uint16_t q = 0; q < nb_rx_queues && q < nb_worker_lcores; q++)
+			rte_eal_remote_launch(rx_loop, &rx_ctxs[q], worker_lcores[q]);
+
+		if (nb_worker_lcores == 0)
 			printf("Warning: no secondary lcore available; RX disabled. "
 			       "Run with at least -l 0-1\n");
 		else
-			printf("Launched %u RX lcore(s)\n", q);
+			printf("Single-lcore mode: launched %u RX lcore(s)\n", nb_rx_queues);
 	}
 
 	/* --- TX runs on the main lcore --- */
