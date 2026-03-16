@@ -43,6 +43,24 @@
 #define HIST_NUM_BINS  10000
 #define HIST_BIN_WIDTH 1       /* latency units per bin */
 
+/* Maximum number of RX queues / worker lcores */
+#define MAX_RX_QUEUES  16
+
+/* Per-RX-queue context: packet counter and per-lcore histogram. */
+struct rx_ctx {
+	uint16_t  queue_id;
+	uint64_t  rx_total;
+	/* per-lcore histogram (only populated when latency_mode is set) */
+	uint64_t  hist_bins[HIST_NUM_BINS];
+	uint64_t  hist_overflow;
+	uint64_t  hist_total;
+	uint32_t  hist_min;
+	uint32_t  hist_max;
+};
+
+static struct rx_ctx  rx_ctxs[MAX_RX_QUEUES];
+static uint16_t       nb_rx_queues;
+
 static volatile int keep_running = 1;
 static struct rte_mempool *rx_mbuf_pool;
 static struct rte_mempool *tx_mbuf_pool;
@@ -72,21 +90,6 @@ static uint64_t hist_overflow;          /* counts above the last bin */
 static uint64_t hist_total;
 static uint32_t hist_global_min;
 static uint32_t hist_global_max;
-
-static void hist_record(uint32_t latency)
-{
-	uint32_t bin = latency / HIST_BIN_WIDTH;
-	if (bin < HIST_NUM_BINS)
-		hist_bins[bin]++;
-	else
-		hist_overflow++;
-	hist_total++;
-
-	if (latency < hist_global_min)
-		hist_global_min = latency;
-	if (latency > hist_global_max)
-		hist_global_max = latency;
-}
 
 /*
  * Returns percentile as the lower edge of the histogram bin that contains
@@ -168,8 +171,9 @@ static void signal_handler(int sig)
 	keep_running = 0;
 }
 
-/* Initialise a single ethernet port. */
-static int port_init(uint16_t port)
+/* Initialise a single ethernet port with the requested number of RX queues.
+ * *nb_queues may be reduced if the device supports fewer. */
+static int port_init(uint16_t port, uint16_t *nb_queues)
 {
 	struct rte_eth_conf port_conf = {0};
 	struct rte_eth_dev_info dev_info;
@@ -190,7 +194,19 @@ static int port_init(uint16_t port)
 	if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
 		port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
 
-	ret = rte_eth_dev_configure(port, 1, 1, &port_conf);
+	/* Cap to what the device supports */
+	if (*nb_queues > dev_info.max_rx_queues)
+		*nb_queues = dev_info.max_rx_queues;
+
+	/* Enable RSS when using multiple RX queues */
+	if (*nb_queues > 1) {
+		port_conf.rxmode.mq_mode = RTE_ETH_MQ_RX_RSS;
+		port_conf.rx_adv_conf.rss_conf.rss_hf =
+			dev_info.flow_type_rss_offloads &
+			(RTE_ETH_RSS_IP | RTE_ETH_RSS_UDP);
+	}
+
+	ret = rte_eth_dev_configure(port, *nb_queues, 1, &port_conf);
 	if (ret != 0)
 		return ret;
 
@@ -198,10 +214,12 @@ static int port_init(uint16_t port)
 	if (ret != 0)
 		return ret;
 
-	ret = rte_eth_rx_queue_setup(port, 0, nb_rxd,
-			rte_eth_dev_socket_id(port), NULL, rx_mbuf_pool);
-	if (ret < 0)
-		return ret;
+	for (uint16_t q = 0; q < *nb_queues; q++) {
+		ret = rte_eth_rx_queue_setup(port, q, nb_rxd,
+				rte_eth_dev_socket_id(port), NULL, rx_mbuf_pool);
+		if (ret < 0)
+			return ret;
+	}
 
 	ret = rte_eth_tx_queue_setup(port, 0, nb_txd,
 			rte_eth_dev_socket_id(port), NULL);
@@ -344,12 +362,12 @@ static int parse_payload_len(const char *arg, uint16_t *value)
 	return 0;
 }
 
-/* RX loop: runs on a secondary lcore. */
-static int rx_loop(__rte_unused void *arg)
+/* RX loop: runs on a worker lcore. arg points to this lcore's rx_ctx. */
+static int rx_loop(void *arg)
 {
-	uint16_t port = 0;
+	struct rx_ctx *ctx = arg;
+	uint16_t queue = ctx->queue_id;
 	struct rte_mbuf *bufs[BURST_SIZE];
-	uint64_t rx_total = 0;
 	uint64_t last_print = rte_rdtsc();
 	uint64_t hz = rte_get_tsc_hz();
 
@@ -359,20 +377,21 @@ static int rx_loop(__rte_unused void *arg)
 	uint32_t lat_min = UINT32_MAX;
 	uint32_t lat_max = 0;
 
-	/* Initialise global histogram bounds */
-	hist_global_min = UINT32_MAX;
-	hist_global_max = 0;
+	if (latency_mode) {
+		ctx->hist_min = UINT32_MAX;
+		ctx->hist_max = 0;
+	}
 
-	printf("[RX] Running on lcore %u\n", rte_lcore_id());
+	printf("[RX] lcore %u polling queue %u\n", rte_lcore_id(), queue);
 	if (!latency_mode)
 		printf("[RX] Latency/histogram tracking disabled\n");
 
 	while (keep_running) {
-		uint16_t nb_rx = rte_eth_rx_burst(port, 0, bufs, BURST_SIZE);
+		uint16_t nb_rx = rte_eth_rx_burst(0, queue, bufs, BURST_SIZE);
 		if (nb_rx == 0)
 			continue;
 
-		rx_total += nb_rx;
+		ctx->rx_total += nb_rx;
 
 		for (uint16_t i = 0; i < nb_rx; i++) {
 			struct rte_mbuf *m = bufs[i];
@@ -382,9 +401,10 @@ static int rx_loop(__rte_unused void *arg)
 				uint8_t *pkt = rte_pktmbuf_mtod(m, uint8_t *);
 
 				if (debug_mode) {
-					printf("[RX-DBG] pkt #%"PRIu64" (%u bytes) "
+					printf("[RX-DBG] q%u pkt #%"PRIu64" (%u bytes) "
 					       "first 47 bytes:\n",
-					       rx_total, rte_pktmbuf_data_len(m));
+					       queue, ctx->rx_total,
+					       rte_pktmbuf_data_len(m));
 					for (int b = 0; b < 47; b++) {
 						printf("%02x ", pkt[b]);
 						if ((b & 0xf) == 0xf)
@@ -413,8 +433,17 @@ static int rx_loop(__rte_unused void *arg)
 				if (latency > lat_max)
 					lat_max = latency;
 
-				/* Record in global histogram */
-				hist_record(latency);
+				/* Record in per-lcore histogram */
+				uint32_t bin = latency / HIST_BIN_WIDTH;
+				if (bin < HIST_NUM_BINS)
+					ctx->hist_bins[bin]++;
+				else
+					ctx->hist_overflow++;
+				ctx->hist_total++;
+				if (latency < ctx->hist_min)
+					ctx->hist_min = latency;
+				if (latency > ctx->hist_max)
+					ctx->hist_max = latency;
 			}
 
 			rte_pktmbuf_free(m);
@@ -424,12 +453,12 @@ static int rx_loop(__rte_unused void *arg)
 		uint64_t now = rte_rdtsc();
 		if (now - last_print >= hz) {
 			if (latency_mode && lat_count > 0) {
-				printf("[RX] total=%'lu  interval_pkts=%"PRIu64
+				printf("[RX] q%u total=%'lu  interval_pkts=%"PRIu64
 				       "  latency min=%u avg=%"PRIu64" max=%u\n",
-				       rx_total, lat_count,
+				       queue, ctx->rx_total, lat_count,
 				       lat_min, lat_sum / lat_count, lat_max);
 			} else {
-				printf("[RX] total=%'lu\n", rx_total);
+				printf("[RX] q%u total=%'lu\n", queue, ctx->rx_total);
 			}
 			last_print = now;
 			lat_sum = 0;
@@ -439,9 +468,34 @@ static int rx_loop(__rte_unused void *arg)
 		}
 	}
 
-	printf("[RX] Total packets received: %'lu\n", rx_total);
-	rx_total_global = rx_total;
+	printf("[RX] q%u total packets received: %'lu\n", queue, ctx->rx_total);
 	return 0;
+}
+
+/* Merge per-lcore RX stats into global counters. Must be called after all
+ * worker lcores have been joined. */
+static void merge_rx_ctxs(void)
+{
+	hist_global_min = UINT32_MAX;
+	hist_global_max = 0;
+
+	for (uint16_t q = 0; q < nb_rx_queues; q++) {
+		struct rx_ctx *ctx = &rx_ctxs[q];
+
+		rx_total_global += ctx->rx_total;
+
+		if (!latency_mode)
+			continue;
+
+		for (uint32_t i = 0; i < HIST_NUM_BINS; i++)
+			hist_bins[i] += ctx->hist_bins[i];
+		hist_overflow += ctx->hist_overflow;
+		hist_total    += ctx->hist_total;
+		if (ctx->hist_min < hist_global_min)
+			hist_global_min = ctx->hist_min;
+		if (ctx->hist_max > hist_global_max)
+			hist_global_max = ctx->hist_max;
+	}
 }
 
 /* TX loop: runs on the main lcore. */
@@ -602,6 +656,16 @@ int main(int argc, char *argv[])
 	printf("Latency / histogram tracking: %s\n",
 	       latency_mode ? "enabled" : "disabled");
 
+	/* Determine how many RX queues/lcores to use */
+	nb_rx_queues = 0;
+	RTE_LCORE_FOREACH_WORKER(lcore_id) {
+		nb_rx_queues++;
+		if (nb_rx_queues == MAX_RX_QUEUES)
+			break;
+	}
+	if (nb_rx_queues == 0)
+		nb_rx_queues = 1;
+
 	/* --- Create RX/TX mbuf pools --- */
 	rx_mbuf_pool = rte_pktmbuf_pool_create("RX_MBUF_POOL", NUM_MBUFS * nb_ports,
 						MBUF_CACHE, 0,
@@ -624,23 +688,32 @@ int main(int argc, char *argv[])
 		rte_exit(EXIT_FAILURE, "Cannot preload TX mbuf pool\n");
 
 	/* --- Initialise port --- */
-	ret = port_init(port_id);
+	ret = port_init(port_id, &nb_rx_queues);
 	if (ret != 0)
 		rte_exit(EXIT_FAILURE, "Cannot init port %u: %s\n",
 			 port_id, rte_strerror(-ret));
 
-	/* --- Launch RX on the first available secondary lcore --- */
-	int rx_launched = 0;
-	RTE_LCORE_FOREACH_WORKER(lcore_id) {
-		if (!rx_launched) {
-			rte_eal_remote_launch(rx_loop, NULL, lcore_id);
-			rx_launched = 1;
-			break;
+	/* Initialise per-queue RX contexts */
+	memset(rx_ctxs, 0, sizeof(rx_ctxs));
+	for (uint16_t q = 0; q < nb_rx_queues; q++)
+		rx_ctxs[q].queue_id = q;
+	printf("Using %u RX queue(s)\n", nb_rx_queues);
+
+	/* --- Launch one RX lcore per queue --- */
+	{
+		uint16_t q = 0;
+		RTE_LCORE_FOREACH_WORKER(lcore_id) {
+			if (q >= nb_rx_queues)
+				break;
+			rte_eal_remote_launch(rx_loop, &rx_ctxs[q], lcore_id);
+			q++;
 		}
+		if (q == 0)
+			printf("Warning: no secondary lcore available; RX disabled. "
+			       "Run with at least -l 0-1\n");
+		else
+			printf("Launched %u RX lcore(s)\n", q);
 	}
-	if (!rx_launched)
-		printf("Warning: no secondary lcore available; RX disabled. "
-		       "Run with at least -l 0-1\n");
 
 	/* --- TX runs on the main lcore --- */
 	tx_loop(port_id);
@@ -654,6 +727,9 @@ int main(int argc, char *argv[])
 	RTE_LCORE_FOREACH_WORKER(lcore_id) {
 		rte_eal_wait_lcore(lcore_id);
 	}
+
+	/* --- Merge per-lcore RX stats into globals --- */
+	merge_rx_ctxs();
 
 	printf("[STATS] Packet diff (sent - received): %" PRId64
 	       "  (sent=%" PRIu64 " received=%" PRIu64 ")\n",
