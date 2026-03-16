@@ -40,7 +40,7 @@
 #define MAX_PAYLOAD_LEN (UINT16_MAX - sizeof(struct rte_ipv4_hdr) - sizeof(struct rte_udp_hdr))
 
 /* Histogram parameters */
-#define HIST_NUM_BINS  1000
+#define HIST_NUM_BINS  10000
 #define HIST_BIN_WIDTH 1       /* latency units per bin */
 
 static volatile int keep_running = 1;
@@ -57,6 +57,14 @@ static uint16_t template_pkt_len;
 
 /* Debug mode: dump raw bytes of each received packet */
 static int debug_mode;
+
+/* Latency / histogram mode: disabled by default */
+static int latency_mode;
+
+/* Test mode */
+static int test_mode;
+static volatile uint64_t tx_total_global = 0;
+static volatile uint64_t rx_total_global = 0;
 
 /* Global histogram – filled by the RX lcore, read after join. */
 static uint64_t hist_bins[HIST_NUM_BINS];
@@ -78,6 +86,34 @@ static void hist_record(uint32_t latency)
 		hist_global_min = latency;
 	if (latency > hist_global_max)
 		hist_global_max = latency;
+}
+
+/*
+ * Returns percentile as the lower edge of the histogram bin that contains
+ * the rank. permille: 500 = p50, 990 = p99, 999 = p99.9.
+ */
+static uint32_t hist_percentile_bin_start(uint32_t permille, int *in_overflow)
+{
+	uint64_t cumulative = 0;
+	uint64_t rank;
+
+	*in_overflow = 0;
+	if (hist_total == 0)
+		return 0;
+
+	/* ceil(hist_total * permille / 1000) without floating point */
+	rank = (hist_total * permille + 999) / 1000;
+	if (rank == 0)
+		rank = 1;
+
+	for (uint32_t i = 0; i < HIST_NUM_BINS; i++) {
+		cumulative += hist_bins[i];
+		if (cumulative >= rank)
+			return i * HIST_BIN_WIDTH;
+	}
+
+	*in_overflow = 1;
+	return HIST_NUM_BINS * HIST_BIN_WIDTH;
 }
 
 static void hist_dump(const char *filename)
@@ -106,6 +142,24 @@ static void hist_dump(const char *filename)
 	       "(min=%u max=%u overflow=%" PRIu64 ")\n",
 	       hist_total, filename,
 	       hist_global_min, hist_global_max, hist_overflow);
+
+	if (hist_total > 0) {
+		int p50_overflow;
+		int p99_overflow;
+		int p999_overflow;
+		uint32_t p50 = hist_percentile_bin_start(500, &p50_overflow);
+		uint32_t p99 = hist_percentile_bin_start(990, &p99_overflow);
+		uint32_t p999 = hist_percentile_bin_start(999, &p999_overflow);
+
+		printf("[HIST-PCT] p50=%u%s  p99=%u%s  p99.9=%u%s\n",
+		       p50, p50_overflow ? "+" : "",
+		       p99, p99_overflow ? "+" : "",
+		       p999, p999_overflow ? "+" : "");
+		printf("[HIST-PCT (us)] p50=%.2f%s  p99=%.2f%s  p99.9=%.2f%s\n",
+		       4*p50/1000.0, p50_overflow ? "+" : "",
+		       4*p99/1000.0, p99_overflow ? "+" : "",
+		       4*p999/1000.0, p999_overflow ? "+" : "");	   
+	}
 }
 
 static void signal_handler(int sig)
@@ -310,6 +364,8 @@ static int rx_loop(__rte_unused void *arg)
 	hist_global_max = 0;
 
 	printf("[RX] Running on lcore %u\n", rte_lcore_id());
+	if (!latency_mode)
+		printf("[RX] Latency/histogram tracking disabled\n");
 
 	while (keep_running) {
 		uint16_t nb_rx = rte_eth_rx_burst(port, 0, bufs, BURST_SIZE);
@@ -322,7 +378,7 @@ static int rx_loop(__rte_unused void *arg)
 			struct rte_mbuf *m = bufs[i];
 
 			/* Need at least 47 bytes to read both timestamps */
-			if (rte_pktmbuf_data_len(m) >= 47) {
+			if (latency_mode && rte_pktmbuf_data_len(m) >= 47) {
 				uint8_t *pkt = rte_pktmbuf_mtod(m, uint8_t *);
 
 				if (debug_mode) {
@@ -367,14 +423,13 @@ static int rx_loop(__rte_unused void *arg)
 		/* Print a summary every second */
 		uint64_t now = rte_rdtsc();
 		if (now - last_print >= hz) {
-			if (lat_count > 0) {
-				printf("[RX] total=%"PRIu64"  interval_pkts=%"PRIu64
+			if (latency_mode && lat_count > 0) {
+				printf("[RX] total=%'lu  interval_pkts=%"PRIu64
 				       "  latency min=%u avg=%"PRIu64" max=%u\n",
 				       rx_total, lat_count,
 				       lat_min, lat_sum / lat_count, lat_max);
 			} else {
-				printf("[RX] total=%"PRIu64"  (no timestamped packets)\n",
-				       rx_total);
+				printf("[RX] total=%'lu\n", rx_total);
 			}
 			last_print = now;
 			lat_sum = 0;
@@ -384,7 +439,8 @@ static int rx_loop(__rte_unused void *arg)
 		}
 	}
 
-	printf("[RX] Total packets received: %"PRIu64"\n", rx_total);
+	printf("[RX] Total packets received: %'lu\n", rx_total);
+	rx_total_global = rx_total;
 	return 0;
 }
 
@@ -394,6 +450,7 @@ static void tx_loop(uint16_t port)
 	struct rte_mbuf *bufs[BURST_SIZE];
 	uint64_t tx_total = 0;
 	uint64_t packet_index = 0;
+	uint64_t start_tsc = rte_rdtsc();
 	uint64_t last_print = rte_rdtsc();
 	uint64_t hz = rte_get_tsc_hz();
 
@@ -416,6 +473,12 @@ static void tx_loop(uint16_t port)
 	uint64_t next_send = rte_rdtsc();
 
 	while (keep_running) {
+		if (test_mode && (rte_rdtsc() - start_tsc) >= (10 * hz)) {
+			printf("[TEST] 10 second run completed, stopping traffic\n");
+			keep_running = 0;
+			break;
+		}
+
 		/* Pace: wait until it's time to send the next burst */
 		if (ticks_per_burst > 0) {
 			while (rte_rdtsc() < next_send && keep_running)
@@ -450,21 +513,25 @@ stats:
 	}
 
 	printf("[TX] Total packets sent: %'lu\n", tx_total);
+	tx_total_global = tx_total;
 }
 
 static void usage(const char *prog)
 {
-	printf("Usage: %s [EAL options] -- [--pps <packets/sec>] [--payload-len <bytes>] [--range] [--debug]\n"
+	printf("Usage: %s [EAL options] -- [--pps <packets/sec>] [--payload-len <bytes>] [--range] [--debug] [--test] [--latency]\n"
 	       "  --pps N   Target TX rate in packets per second (0 = line rate, default)\n"
 	       "  --payload-len N   UDP payload size in bytes (default: %u, max: %u)\n"
 	       "  --range   Vary the destination IPv4 low 16 bits for each packet\n"
-	       "  --debug   Hex-dump received packets up to the timestamp fields\n",
+	       "  --debug   Hex-dump received packets up to the timestamp fields\n"
+	       "  --test    Run traffic for 10 seconds, wait 1 second, then exit\n"
+	       "  --latency Enable latency tracking and histogram (default: disabled)\n",
 	       prog, DEFAULT_PAYLOAD_LEN, (unsigned int)MAX_PAYLOAD_LEN);
 }
 
 int main(int argc, char *argv[])
 {
 	int ret;
+	int exit_status = 0;
 	uint16_t port_id = 0;
 	uint16_t nb_ports;
 	unsigned int lcore_id;
@@ -484,12 +551,14 @@ int main(int argc, char *argv[])
 		{"payload-len", required_argument, NULL, 's'},
 		{"range",       no_argument,       NULL, 'r'},
 		{"debug",       no_argument,       NULL, 'd'},
+		{"test",        no_argument,       NULL, 't'},
+		{"latency",     no_argument,       NULL, 'l'},
 		{"help",        no_argument,       NULL, 'h'},
 		{NULL,           0,                 NULL,  0 }
 	};
 
 	int opt;
-	while ((opt = getopt_long(argc, argv, "p:s:rdh", long_options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "p:s:rdtlh", long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'p':
 			target_pps = strtoull(optarg, NULL, 10);
@@ -505,6 +574,12 @@ int main(int argc, char *argv[])
 			break;
 		case 'd':
 			debug_mode = 1;
+			break;
+		case 't':
+			test_mode = 1;
+			break;
+		case 'l':
+			latency_mode = 1;
 			break;
 		case 'h':
 		default:
@@ -524,6 +599,8 @@ int main(int argc, char *argv[])
 	printf("Configured UDP payload length: %u bytes\n", payload_len);
 	printf("Destination IP range mode: %s\n",
 	       range_mode ? "enabled (varying low 16 bits)" : "disabled");
+	printf("Latency / histogram tracking: %s\n",
+	       latency_mode ? "enabled" : "disabled");
 
 	/* --- Create RX/TX mbuf pools --- */
 	rx_mbuf_pool = rte_pktmbuf_pool_create("RX_MBUF_POOL", NUM_MBUFS * nb_ports,
@@ -568,18 +645,55 @@ int main(int argc, char *argv[])
 	/* --- TX runs on the main lcore --- */
 	tx_loop(port_id);
 
+	if (test_mode) {
+		printf("[TEST] Waiting 1 second before exit\n");
+		rte_delay_ms(1000);
+	}
+
 	/* --- Wait for RX lcore --- */
 	RTE_LCORE_FOREACH_WORKER(lcore_id) {
 		rte_eal_wait_lcore(lcore_id);
 	}
 
+	printf("[STATS] Packet diff (sent - received): %" PRId64
+	       "  (sent=%" PRIu64 " received=%" PRIu64 ")\n",
+	       (int64_t)tx_total_global - (int64_t)rx_total_global,
+	       tx_total_global, rx_total_global);
+
+	{
+		uint64_t sent = tx_total_global;
+		uint64_t received = rx_total_global;
+		uint64_t abs_diff = (sent >= received) ? (sent - received)
+		                                     : (received - sent);
+		int success;
+
+		/* diff < 0.1% of sent packets, i.e. abs_diff * 1000 < sent */
+		if (sent == 0)
+			success = (abs_diff == 0);
+		else
+			success = (abs_diff * 1000ULL < sent);
+
+		if (success) {
+			printf("\x1b[32mSUCCESS\x1b[0m: final diff=%" PRIu64
+			       " (< 0.1%% of sent=%" PRIu64 ")\n",
+			       abs_diff, sent);
+			exit_status = 0;
+		} else {
+			printf("\x1b[35mFAIL\x1b[0m: final diff=%" PRIu64
+			       " (>= 0.1%% of sent=%" PRIu64 ")\n",
+			       abs_diff, sent);
+			exit_status = -1;
+		}
+	}
+
 	/* --- Dump latency histogram --- */
-	hist_dump("latency_histogram.csv");
+	if (latency_mode)
+		hist_dump("latency_histogram.csv");
 
 	/* --- Cleanup --- */
 	rte_eth_dev_stop(port_id);
 	rte_eth_dev_close(port_id);
 	rte_eal_cleanup();
 
-	return 0;
+	return exit_status;
 }
