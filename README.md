@@ -47,9 +47,32 @@ Press **Ctrl-C** to stop; the app prints TX/RX totals on exit.
 | Flag | Description |
 |------|-------------|
 | `--pps N` | Target TX rate in packets per second (`0` = line rate) |
+| `--tx-cores N` | Number of TX lcores (includes main lcore). Default `1` |
 | `--payload-len N` | UDP payload size in bytes (default `64`) |
 | `--range` | Change the last 2 bytes of the destination IPv4 address for each packet |
 | `--debug` | Hex-dump received packets and parsed timestamp fields |
+
+### `--tx-cores` examples
+
+Default behavior (single TX lcore on main):
+
+```bash
+sudo ./build/packetgenlatency -l 0-3 -n 4 -- --tx-cores 1 --range
+```
+
+Two TX lcores (main + one worker), remaining workers used for RX:
+
+```bash
+sudo ./build/packetgenlatency -l 0-5 -n 4 -- --tx-cores 2 --test --range
+```
+
+Four TX lcores (main + three workers) with a global rate limit:
+
+```bash
+sudo ./build/packetgenlatency -l 0-9 -n 4 -- --tx-cores 4 --pps 4000000 --range
+```
+
+Note: `--tx-cores` must be less than or equal to the total selected lcores, and the NIC must support at least that many TX queues.
 
 ## Dummy packet format
 

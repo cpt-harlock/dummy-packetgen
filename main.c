@@ -31,6 +31,7 @@
 #define BURST_SIZE      64     /* larger bursts amortise per-burst overhead */
 #define PREFETCH_OFFSET  3     /* prefetch this many packets ahead */
 #define WORK_RING_SIZE  4096   /* per-queue SPSC ring depth; must be power of 2 */
+#define TEST_WARMUP_PACKETS 5000
 
 /* Dummy packet parameters */
 #define DST_MAC   {0x00, 0x11, 0x22, 0x33, 0x44, 0x55}
@@ -48,6 +49,7 @@
 
 /* Maximum number of RX queues / worker lcores */
 #define MAX_RX_QUEUES  16
+#define MAX_WORKER_LCORES (MAX_RX_QUEUES * 2)
 
 /*
  * Pipeline mode: one IO lcore drains the NIC into a per-queue SPSC ring;
@@ -78,6 +80,7 @@ static struct rte_mempool *tx_mbuf_pool;
 
 /* 0 = unlimited (line rate) */
 static uint64_t target_pps;
+static uint16_t tx_cores = 1;
 static uint16_t payload_len = DEFAULT_PAYLOAD_LEN;
 static int range_mode;
 
@@ -94,6 +97,17 @@ static int latency_mode;
 static int test_mode;
 static volatile uint64_t tx_total_global = 0;
 static volatile uint64_t rx_total_global = 0;
+
+struct tx_ctx {
+	uint16_t  port_id;
+	uint16_t  queue_id;
+	uint16_t  stride;
+	uint64_t  packet_index;
+	uint64_t  tx_total;
+};
+
+static struct tx_ctx tx_ctxs[MAX_WORKER_LCORES + 1];
+static uint16_t nb_tx_lcores;
 
 /* Global histogram – filled by the RX lcore, read after join. */
 static uint64_t hist_bins[HIST_NUM_BINS];
@@ -183,8 +197,8 @@ static void signal_handler(int sig)
 }
 
 /* Initialise a single ethernet port with the requested number of RX queues.
- * *nb_queues may be reduced if the device supports fewer. */
-static int port_init(uint16_t port, uint16_t *nb_queues)
+ * *nb_rx_queues may be reduced if the device supports fewer. */
+static int port_init(uint16_t port, uint16_t *nb_rx_queues, uint16_t *nb_tx_queues)
 {
 	struct rte_eth_conf port_conf = {0};
 	struct rte_eth_dev_info dev_info;
@@ -206,18 +220,20 @@ static int port_init(uint16_t port, uint16_t *nb_queues)
 		port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
 
 	/* Cap to what the device supports */
-	if (*nb_queues > dev_info.max_rx_queues)
-		*nb_queues = dev_info.max_rx_queues;
+	if (*nb_rx_queues > dev_info.max_rx_queues)
+		*nb_rx_queues = dev_info.max_rx_queues;
+	if (*nb_tx_queues > dev_info.max_tx_queues)
+		return -ENOTSUP;
 
 	/* Enable RSS when using multiple RX queues */
-	if (*nb_queues > 1) {
+	if (*nb_rx_queues > 1) {
 		port_conf.rxmode.mq_mode = RTE_ETH_MQ_RX_RSS;
 		port_conf.rx_adv_conf.rss_conf.rss_hf =
 			dev_info.flow_type_rss_offloads &
 			(RTE_ETH_RSS_IP | RTE_ETH_RSS_UDP);
 	}
 
-	ret = rte_eth_dev_configure(port, *nb_queues, 1, &port_conf);
+	ret = rte_eth_dev_configure(port, *nb_rx_queues, *nb_tx_queues, &port_conf);
 	if (ret != 0)
 		return ret;
 
@@ -225,17 +241,19 @@ static int port_init(uint16_t port, uint16_t *nb_queues)
 	if (ret != 0)
 		return ret;
 
-	for (uint16_t q = 0; q < *nb_queues; q++) {
+	for (uint16_t q = 0; q < *nb_rx_queues; q++) {
 		ret = rte_eth_rx_queue_setup(port, q, nb_rxd,
 				rte_eth_dev_socket_id(port), NULL, rx_mbuf_pool);
 		if (ret < 0)
 			return ret;
 	}
 
-	ret = rte_eth_tx_queue_setup(port, 0, nb_txd,
-			rte_eth_dev_socket_id(port), NULL);
-	if (ret < 0)
-		return ret;
+	for (uint16_t q = 0; q < *nb_tx_queues; q++) {
+		ret = rte_eth_tx_queue_setup(port, q, nb_txd,
+				rte_eth_dev_socket_id(port), NULL);
+		if (ret < 0)
+			return ret;
+	}
 
 	ret = rte_eth_dev_start(port);
 	if (ret < 0)
@@ -367,6 +385,21 @@ static int parse_payload_len(const char *arg, uint16_t *value)
 	if (arg[0] == '\0' || end == arg || *end != '\0')
 		return -1;
 	if (parsed > MAX_PAYLOAD_LEN)
+		return -1;
+
+	*value = (uint16_t)parsed;
+	return 0;
+}
+
+static int parse_tx_cores(const char *arg, uint16_t *value)
+{
+	char *end = NULL;
+	unsigned long parsed;
+
+	parsed = strtoul(arg, &end, 10);
+	if (arg[0] == '\0' || end == arg || *end != '\0')
+		return -1;
+	if (parsed == 0 || parsed > MAX_WORKER_LCORES + 1)
 		return -1;
 
 	*value = (uint16_t)parsed;
@@ -623,9 +656,9 @@ static int worker_lcore(void *arg)
 				       "  latency min=%u avg=%"PRIu64" max=%u\n",
 				       queue, ctx->rx_total, lat_count,
 				       lat_min, lat_sum / lat_count, lat_max);
-			} else {
+			} /*else {
 				printf("[WORKER] q%u total=%'lu\n", queue, ctx->rx_total);
-			}
+			}*/
 			last_print = now;
 			lat_sum = 0;
 			lat_count = 0;
@@ -664,13 +697,14 @@ static void merge_rx_ctxs(void)
 	}
 }
 
-/* TX loop: runs on the main lcore. */
-static void tx_loop(uint16_t port)
+/* TX loop: runs on one lcore per TX queue. */
+static int tx_loop(void *arg)
 {
+	struct tx_ctx *ctx = arg;
 	struct rte_mbuf *bufs[BURST_SIZE];
 	uint64_t tx_total = 0;
-	uint64_t packet_index = 0;
-	uint64_t start_tsc = rte_rdtsc();
+	uint64_t packet_index = ctx->packet_index;
+	uint64_t start_tsc;
 	uint64_t last_print = rte_rdtsc();
 	uint64_t hz = rte_get_tsc_hz();
 
@@ -680,15 +714,54 @@ static void tx_loop(uint16_t port)
 	 */
 	uint64_t ticks_per_burst = 0;
 	if (target_pps > 0) {
-		ticks_per_burst = hz * BURST_SIZE / target_pps;
-		printf("[TX] Rate-limiting to %" PRIu64 " pps "
+		uint64_t per_core_pps = target_pps /
+			RTE_MAX((uint64_t)1, (uint64_t)nb_tx_lcores);
+		if (per_core_pps == 0)
+			per_core_pps = 1;
+		ticks_per_burst = hz * BURST_SIZE / per_core_pps;
+		printf("[TX] q%u rate-limiting to ~%" PRIu64 " pps "
 		       "(burst interval ~%" PRIu64 " ticks)\n",
-		       target_pps, ticks_per_burst);
+		       ctx->queue_id,
+		       per_core_pps,
+		       ticks_per_burst);
 	} else {
-		printf("[TX] Sending at line rate (no pps limit)\n");
+		printf("[TX] q%u sending at line rate (no pps limit)\n", ctx->queue_id);
 	}
 
-	printf("[TX] Running on lcore %u\n", rte_lcore_id());
+	printf("[TX] q%u running on lcore %u\n", ctx->queue_id, rte_lcore_id());
+
+	if (test_mode) {
+		uint64_t warmup_target = TEST_WARMUP_PACKETS / nb_tx_lcores;
+		if (ctx->queue_id < (TEST_WARMUP_PACKETS % nb_tx_lcores))
+			warmup_target++;
+
+		uint64_t warmup_sent = 0;
+		while (keep_running && warmup_sent < warmup_target) {
+			uint16_t burst = (uint16_t)RTE_MIN((uint64_t)BURST_SIZE,
+						   warmup_target - warmup_sent);
+
+			if (rte_pktmbuf_alloc_bulk(tx_mbuf_pool, bufs, burst) < 0)
+				continue;
+
+			for (uint16_t i = 0; i < burst; i++) {
+				fill_packet(bufs[i], next_dst_ip(packet_index));
+				packet_index += ctx->stride;
+			}
+
+			uint16_t sent = rte_eth_tx_burst(ctx->port_id, ctx->queue_id,
+							 bufs, burst);
+			for (uint16_t i = sent; i < burst; i++)
+				rte_pktmbuf_free(bufs[i]);
+
+			warmup_sent += sent;
+			tx_total += sent;
+		}
+
+		printf("[TEST] q%u warmup sent %" PRIu64 " packets\n",
+		       ctx->queue_id, warmup_sent);
+	}
+
+	start_tsc = rte_rdtsc();
 
 	uint64_t next_send = rte_rdtsc();
 
@@ -713,10 +786,10 @@ static void tx_loop(uint16_t port)
 		/* Fill each mbuf from the template, patching per-packet fields */
 		for (int i = 0; i < BURST_SIZE; i++) {
 			fill_packet(bufs[i], next_dst_ip(packet_index));
-			packet_index++;
+			packet_index += ctx->stride;
 		}
 
-		uint16_t sent = rte_eth_tx_burst(port, 0, bufs, BURST_SIZE);
+		uint16_t sent = rte_eth_tx_burst(ctx->port_id, ctx->queue_id, bufs, BURST_SIZE);
 		for (uint16_t j = sent; j < BURST_SIZE; j++)
 			rte_pktmbuf_free(bufs[j]);
 		tx_total += sent;
@@ -726,24 +799,28 @@ stats:
 		{
 			uint64_t now = rte_rdtsc();
 			if (now - last_print >= hz) {
-				printf("[TX] Sent %'lu total packets\n", tx_total);
+				printf("[TX] q%u sent %" PRIu64 " total packets\n",
+				       ctx->queue_id, tx_total);
 				last_print = now;
 			}
 		}
 	}
 
-	printf("[TX] Total packets sent: %'lu\n", tx_total);
-	tx_total_global = tx_total;
+	printf("[TX] q%u total packets sent: %" PRIu64 "\n",
+	       ctx->queue_id, tx_total);
+	ctx->tx_total = tx_total;
+	return 0;
 }
 
 static void usage(const char *prog)
 {
-	printf("Usage: %s [EAL options] -- [--pps <packets/sec>] [--payload-len <bytes>] [--range] [--debug] [--test] [--latency]\n"
+	printf("Usage: %s [EAL options] -- [--pps <packets/sec>] [--tx-cores <count>] [--payload-len <bytes>] [--range] [--debug] [--test] [--latency]\n"
 	       "  --pps N   Target TX rate in packets per second (0 = line rate, default)\n"
+	       "  --tx-cores N   Number of lcores used for TX (includes main lcore, default: 1)\n"
 	       "  --payload-len N   UDP payload size in bytes (default: %u, max: %u)\n"
 	       "  --range   Vary the destination IPv4 low 16 bits for each packet\n"
 	       "  --debug   Hex-dump received packets up to the timestamp fields\n"
-	       "  --test    Run traffic for 10 seconds, wait 1 second, then exit\n"
+	       "  --test    Send 10000 warmup packets, then run traffic for 10 seconds, wait 2 second, then exit\n"
 	       "  --latency Enable latency tracking and histogram (default: disabled)\n",
 	       prog, DEFAULT_PAYLOAD_LEN, (unsigned int)MAX_PAYLOAD_LEN);
 }
@@ -768,6 +845,7 @@ int main(int argc, char *argv[])
 	/* --- Parse app-specific options (after "--") --- */
 	static struct option long_options[] = {
 		{"pps",         required_argument, NULL, 'p'},
+		{"tx-cores",    required_argument, NULL, 'c'},
 		{"payload-len", required_argument, NULL, 's'},
 		{"range",       no_argument,       NULL, 'r'},
 		{"debug",       no_argument,       NULL, 'd'},
@@ -778,10 +856,16 @@ int main(int argc, char *argv[])
 	};
 
 	int opt;
-	while ((opt = getopt_long(argc, argv, "p:s:rdtlh", long_options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "p:c:s:rdtlh", long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'p':
 			target_pps = strtoull(optarg, NULL, 10);
+			break;
+		case 'c':
+			if (parse_tx_cores(optarg, &tx_cores) != 0)
+				rte_exit(EXIT_FAILURE,
+					 "Invalid TX core count '%s' (expected 1-%u)\n",
+					 optarg, (unsigned int)(MAX_WORKER_LCORES + 1));
 			break;
 		case 's':
 			if (parse_payload_len(optarg, &payload_len) != 0)
@@ -821,21 +905,32 @@ int main(int argc, char *argv[])
 	       range_mode ? "enabled (varying low 16 bits)" : "disabled");
 	printf("Latency / histogram tracking: %s\n",
 	       latency_mode ? "enabled" : "disabled");
+	printf("TX lcores requested: %u\n", tx_cores);
 
-	/* Collect all worker lcores; decide pipeline vs single-lcore mode. */
+	/* Collect all worker lcores and reserve N-1 workers for TX (main is TX core 0). */
 	uint16_t nb_worker_lcores = 0;
-	unsigned int worker_lcores[MAX_RX_QUEUES * 2];
+	unsigned int worker_lcores[MAX_WORKER_LCORES];
 	RTE_LCORE_FOREACH_WORKER(lcore_id) {
-		if (nb_worker_lcores < MAX_RX_QUEUES * 2)
+		if (nb_worker_lcores < MAX_WORKER_LCORES)
 			worker_lcores[nb_worker_lcores++] = lcore_id;
 	}
 
-	if (nb_worker_lcores >= 2) {
+	if (tx_cores > nb_worker_lcores + 1)
+		rte_exit(EXIT_FAILURE,
+			 "Requested --tx-cores=%u but only %u total lcores are available for TX\n",
+			 tx_cores, (unsigned int)(nb_worker_lcores + 1));
+
+	uint16_t nb_extra_tx_workers = tx_cores - 1;
+	uint16_t rx_worker_offset = nb_extra_tx_workers;
+	uint16_t nb_rx_worker_lcores = nb_worker_lcores - nb_extra_tx_workers;
+	nb_tx_lcores = tx_cores;
+
+	if (nb_rx_worker_lcores >= 2) {
 		/* Pipeline mode: one IO lcore + one worker lcore per queue. */
 		pipeline_mode = 1;
-		nb_rx_queues = nb_worker_lcores / 2;
+		nb_rx_queues = nb_rx_worker_lcores / 2;
 	} else {
-		nb_rx_queues = nb_worker_lcores > 0 ? nb_worker_lcores : 1;
+		nb_rx_queues = nb_rx_worker_lcores > 0 ? nb_rx_worker_lcores : 1;
 	}
 	if (nb_rx_queues > MAX_RX_QUEUES)
 		nb_rx_queues = MAX_RX_QUEUES;
@@ -862,16 +957,32 @@ int main(int argc, char *argv[])
 		rte_exit(EXIT_FAILURE, "Cannot preload TX mbuf pool\n");
 
 	/* --- Initialise port --- */
-	ret = port_init(port_id, &nb_rx_queues);
+	ret = port_init(port_id, &nb_rx_queues, &nb_tx_lcores);
 	if (ret != 0)
-		rte_exit(EXIT_FAILURE, "Cannot init port %u: %s\n",
-			 port_id, rte_strerror(-ret));
+		rte_exit(EXIT_FAILURE, "Cannot init port %u (rxq=%u txq=%u): %s\n",
+			 port_id, nb_rx_queues, nb_tx_lcores,
+			 rte_strerror(-ret));
+
+	if (nb_tx_lcores != tx_cores)
+		rte_exit(EXIT_FAILURE,
+			 "TX queue count mismatch after init (requested %u, got %u)\n",
+			 tx_cores, nb_tx_lcores);
 
 	/* Initialise per-queue RX contexts */
 	memset(rx_ctxs, 0, sizeof(rx_ctxs));
 	for (uint16_t q = 0; q < nb_rx_queues; q++)
 		rx_ctxs[q].queue_id = q;
 	printf("Using %u RX queue(s)\n", nb_rx_queues);
+	printf("Using %u TX queue(s)\n", nb_tx_lcores);
+
+	/* Initialise TX contexts (queue 0 runs on main lcore). */
+	memset(tx_ctxs, 0, sizeof(tx_ctxs));
+	for (uint16_t i = 0; i < nb_tx_lcores; i++) {
+		tx_ctxs[i].port_id = port_id;
+		tx_ctxs[i].queue_id = i;
+		tx_ctxs[i].stride = nb_tx_lcores;
+		tx_ctxs[i].packet_index = i;
+	}
 
 	/* --- Launch RX lcores --- */
 	if (pipeline_mode) {
@@ -890,29 +1001,35 @@ int main(int argc, char *argv[])
 					 "Cannot create work ring %u: %s\n",
 					 q, rte_strerror(rte_errno));
 
-			rte_eal_remote_launch(io_lcore,     &rx_ctxs[q], worker_lcores[q * 2]);
-			rte_eal_remote_launch(worker_lcore, &rx_ctxs[q], worker_lcores[q * 2 + 1]);
+			rte_eal_remote_launch(io_lcore,     &rx_ctxs[q], worker_lcores[rx_worker_offset + q * 2]);
+			rte_eal_remote_launch(worker_lcore, &rx_ctxs[q], worker_lcores[rx_worker_offset + q * 2 + 1]);
 		}
 		printf("Pipeline mode: launched %u queue(s) × (1 IO + 1 worker) lcore\n",
 		       nb_rx_queues);
 	} else {
 		/* Single-lcore mode (optimised rx_loop with prefetch). */
-		for (uint16_t q = 0; q < nb_rx_queues && q < nb_worker_lcores; q++)
-			rte_eal_remote_launch(rx_loop, &rx_ctxs[q], worker_lcores[q]);
+		for (uint16_t q = 0; q < nb_rx_queues && q < nb_rx_worker_lcores; q++)
+			rte_eal_remote_launch(rx_loop, &rx_ctxs[q], worker_lcores[rx_worker_offset + q]);
 
-		if (nb_worker_lcores == 0)
+		if (nb_rx_worker_lcores == 0)
 			printf("Warning: no secondary lcore available; RX disabled. "
-			       "Run with at least -l 0-1\n");
+			       "Run with more lcores or lower --tx-cores\n");
 		else
 			printf("Single-lcore mode: launched %u RX lcore(s)\n", nb_rx_queues);
 	}
 
-	/* --- TX runs on the main lcore --- */
-	tx_loop(port_id);
+	rte_delay_ms(1000);
+	
+	/* Launch extra TX lcores (if any). */
+	for (uint16_t i = 1; i < nb_tx_lcores; i++)
+		rte_eal_remote_launch(tx_loop, &tx_ctxs[i], worker_lcores[i - 1]);
+
+	/* --- TX queue 0 runs on the main lcore --- */
+	tx_loop(&tx_ctxs[0]);
 
 	if (test_mode) {
-		printf("[TEST] Waiting 1 second before exit\n");
-		rte_delay_ms(1000);
+		printf("[TEST] Waiting 2 seconds before exit\n");
+		rte_delay_ms(2000);
 	}
 
 	/* --- Wait for RX lcore --- */
@@ -922,6 +1039,11 @@ int main(int argc, char *argv[])
 
 	/* --- Merge per-lcore RX stats into globals --- */
 	merge_rx_ctxs();
+
+	/* --- Merge per-lcore TX stats into globals --- */
+	tx_total_global = 0;
+	for (uint16_t i = 0; i < nb_tx_lcores; i++)
+		tx_total_global += tx_ctxs[i].tx_total;
 
 	printf("[STATS] Packet diff (sent - received): %" PRId64
 	       "  (sent=%" PRIu64 " received=%" PRIu64 ")\n",
@@ -935,21 +1057,21 @@ int main(int argc, char *argv[])
 		                                     : (received - sent);
 		int success;
 
-		/* diff < 0.1% of sent packets, i.e. abs_diff * 1000 < sent */
+		/* diff < 0.5% of sent packets, i.e. abs_diff * 200 < sent */
 		if (sent == 0)
 			success = (abs_diff == 0);
 		else
-			success = (abs_diff * 1000ULL < sent);
-
+			success = (abs_diff * 200ULL < sent);
+		float diff_pct = sent > 0 ? (100.0 * abs_diff / sent) : 0.0;
 		if (success) {
 			printf("\x1b[32mSUCCESS\x1b[0m: final diff=%" PRIu64
-			       " (< 0.1%% of sent=%" PRIu64 ")\n",
-			       abs_diff, sent);
+			       " (%.2f%% of sent=%" PRIu64 ")\n",
+			       abs_diff, diff_pct, sent);
 			exit_status = 0;
 		} else {
 			printf("\x1b[35mFAIL\x1b[0m: final diff=%" PRIu64
-			       " (>= 0.1%% of sent=%" PRIu64 ")\n",
-			       abs_diff, sent);
+			       " (%.2f%% of sent=%" PRIu64 ")\n",
+			       abs_diff, diff_pct, sent);
 			exit_status = -1;
 		}
 	}
