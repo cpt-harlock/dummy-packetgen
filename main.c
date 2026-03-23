@@ -6,6 +6,7 @@
 #include <getopt.h>
 #include <limits.h>
 #include <locale.h>
+#include <math.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -32,6 +33,15 @@
 #define PREFETCH_OFFSET  3     /* prefetch this many packets ahead */
 #define WORK_RING_SIZE  4096   /* per-queue SPSC ring depth; must be power of 2 */
 #define TEST_WARMUP_PACKETS 5000
+
+/* Periodic-burst mode parameters */
+#define PERIODIC_BURST_COUNT       2048   /* packets per burst */
+#define PERIODIC_BURST_PAYLOAD_LEN  512   /* UDP payload bytes */
+#define PERIODIC_BURST_INTERVAL_US 1000   /* burst period in microseconds */
+
+/* Poisson-rate mode parameters */
+#define POISSON_RATE_MEAN_PPS    10000000ULL  /* mean rate: 10 Mpps */
+#define POISSON_RATE_INTERVAL_US    5000      /* re-sample every 5 ms */
 
 /* Dummy packet parameters */
 #define DST_MAC   {0x00, 0x11, 0x22, 0x33, 0x44, 0x55}
@@ -95,6 +105,47 @@ static int latency_mode;
 
 /* Test mode */
 static int test_mode;
+
+/* Periodic-burst mode: send PERIODIC_BURST_COUNT packets at start of each 1 ms,
+ * then stay idle for the remainder of the interval. */
+static int periodic_burst_mode;
+
+/* Poisson-rate mode: re-sample TX rate every POISSON_RATE_INTERVAL_US from a
+ * Poisson distribution with mean POISSON_RATE_MEAN_PPS, then pace that many
+ * packets evenly across the interval. */
+static int poisson_rate_mode;
+
+/* --- PRNG + Poisson sampler used by poisson-rate mode --- */
+
+static uint64_t xorshift64(uint64_t *state)
+{
+	uint64_t x = *state;
+	x ^= x << 13;
+	x ^= x >> 7;
+	x ^= x << 17;
+	*state = x;
+	return x;
+}
+
+/*
+ * Sample from Poisson(lambda) via the normal approximation N(lambda, lambda),
+ * valid for large lambda (here ~50 000 per interval).
+ * Uses Box-Muller to generate the N(0,1) variate.
+ */
+static uint64_t poisson_sample(double lambda, uint64_t *rng_state)
+{
+	/* Two uniform samples in (0, 1] */
+	double u1 = (double)((xorshift64(rng_state) >> 11) | 1ULL) /
+		    (double)(1ULL << 53);
+	double u2 = (double)((xorshift64(rng_state) >> 11) | 1ULL) /
+		    (double)(1ULL << 53);
+
+	/* Box-Muller: one N(0,1) sample */
+	double z = sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI * u2);
+
+	double sample = lambda + sqrt(lambda) * z;
+	return sample > 0.0 ? (uint64_t)(sample + 0.5) : 0;
+}
 static volatile uint64_t tx_total_global = 0;
 static volatile uint64_t rx_total_global = 0;
 
@@ -765,11 +816,114 @@ static int tx_loop(void *arg)
 
 	uint64_t next_send = rte_rdtsc();
 
+	/* Periodic-burst state */
+	uint64_t pb_next_burst = rte_rdtsc();
+	uint64_t pb_remaining  = PERIODIC_BURST_COUNT;
+	uint64_t pb_ticks_per_interval = hz * PERIODIC_BURST_INTERVAL_US / 1000000ULL;
+	if (periodic_burst_mode)
+		printf("[TX] q%u periodic-burst mode: %u pkts every %u us\n",
+		       ctx->queue_id,
+		       (unsigned int)PERIODIC_BURST_COUNT,
+		       (unsigned int)PERIODIC_BURST_INTERVAL_US);
+
+	/* Poisson-rate state */
+	uint64_t pr_ticks_per_interval = hz * POISSON_RATE_INTERVAL_US / 1000000ULL;
+	double   pr_lambda = (double)POISSON_RATE_MEAN_PPS *
+			     POISSON_RATE_INTERVAL_US / 1000000.0;
+	uint64_t pr_rng_state   = rte_rdtsc() ^ 0xdeadbeefcafe0000ULL;
+	uint64_t pr_next_interval   = rte_rdtsc() + pr_ticks_per_interval;
+	uint64_t pr_interval_pkts   = (uint64_t)(pr_lambda + 0.5); /* first interval: mean */
+	uint64_t pr_sent_this_interval = 0;
+	/* ticks between BURST_SIZE-packet sends to pace evenly across the interval */
+	uint64_t pr_ticks_per_send  = (pr_interval_pkts > 0)
+		? pr_ticks_per_interval /
+		  ((pr_interval_pkts + BURST_SIZE - 1) / BURST_SIZE)
+		: pr_ticks_per_interval;
+	uint64_t pr_next_send       = rte_rdtsc();
+	if (poisson_rate_mode)
+		printf("[TX] q%u poisson-rate mode: mean %llu pps, "
+		       "re-sample every %u us (lambda=%.0f pkts/interval)\n",
+		       ctx->queue_id,
+		       (unsigned long long)POISSON_RATE_MEAN_PPS,
+		       (unsigned int)POISSON_RATE_INTERVAL_US,
+		       pr_lambda);
+
 	while (keep_running) {
 		if (test_mode && (rte_rdtsc() - start_tsc) >= (10 * hz)) {
 			printf("[TEST] 10 second run completed, stopping traffic\n");
 			keep_running = 0;
 			break;
+		}
+
+		if (periodic_burst_mode) {
+			/* If the current burst is exhausted, idle until the next period. */
+			if (pb_remaining == 0) {
+				if (rte_rdtsc() < pb_next_burst)
+					goto stats;
+				pb_next_burst += pb_ticks_per_interval;
+				pb_remaining   = PERIODIC_BURST_COUNT;
+			}
+
+			uint16_t burst = (uint16_t)RTE_MIN((uint64_t)BURST_SIZE, pb_remaining);
+			if (rte_pktmbuf_alloc_bulk(tx_mbuf_pool, bufs, burst) < 0)
+				goto stats;
+
+			for (uint16_t i = 0; i < burst; i++) {
+				fill_packet(bufs[i], next_dst_ip(packet_index));
+				packet_index += ctx->stride;
+			}
+
+			uint16_t sent = rte_eth_tx_burst(ctx->port_id, ctx->queue_id,
+							 bufs, burst);
+			for (uint16_t j = sent; j < burst; j++)
+				rte_pktmbuf_free(bufs[j]);
+			tx_total   += sent;
+			pb_remaining -= burst;
+			goto stats;
+		}
+
+		if (poisson_rate_mode) {
+			uint64_t now = rte_rdtsc();
+
+			/* Start of a new interval: re-sample the rate. */
+			if (now >= pr_next_interval) {
+				pr_interval_pkts = poisson_sample(pr_lambda, &pr_rng_state);
+				pr_sent_this_interval = 0;
+				pr_next_interval += pr_ticks_per_interval;
+				pr_ticks_per_send = (pr_interval_pkts > 0)
+					? pr_ticks_per_interval /
+					  ((pr_interval_pkts + BURST_SIZE - 1) / BURST_SIZE)
+					: pr_ticks_per_interval;
+				pr_next_send = now;
+			}
+
+			/* Idle for the rest of the interval once quota is filled. */
+			if (pr_sent_this_interval >= pr_interval_pkts)
+				goto stats;
+
+			/* Pace sends evenly across the interval. */
+			if (now < pr_next_send)
+				goto stats;
+			pr_next_send += pr_ticks_per_send;
+
+			uint16_t burst = (uint16_t)RTE_MIN(
+				(uint64_t)BURST_SIZE,
+				pr_interval_pkts - pr_sent_this_interval);
+			if (rte_pktmbuf_alloc_bulk(tx_mbuf_pool, bufs, burst) < 0)
+				goto stats;
+
+			for (uint16_t i = 0; i < burst; i++) {
+				fill_packet(bufs[i], next_dst_ip(packet_index));
+				packet_index += ctx->stride;
+			}
+
+			uint16_t sent = rte_eth_tx_burst(ctx->port_id, ctx->queue_id,
+							 bufs, burst);
+			for (uint16_t j = sent; j < burst; j++)
+				rte_pktmbuf_free(bufs[j]);
+			tx_total += sent;
+			pr_sent_this_interval += sent;
+			goto stats;
 		}
 
 		/* Pace: wait until it's time to send the next burst */
@@ -814,15 +968,23 @@ stats:
 
 static void usage(const char *prog)
 {
-	printf("Usage: %s [EAL options] -- [--pps <packets/sec>] [--tx-cores <count>] [--payload-len <bytes>] [--range] [--debug] [--test] [--latency]\n"
+	printf("Usage: %s [EAL options] -- [--pps <packets/sec>] [--tx-cores <count>] [--payload-len <bytes>] [--range] [--debug] [--test] [--latency] [--periodic-burst] [--poisson-rate]\n"
 	       "  --pps N   Target TX rate in packets per second (0 = line rate, default)\n"
 	       "  --tx-cores N   Number of lcores used for TX (includes main lcore, default: 1)\n"
 	       "  --payload-len N   UDP payload size in bytes (default: %u, max: %u)\n"
 	       "  --range   Vary the destination IPv4 low 16 bits for each packet\n"
 	       "  --debug   Hex-dump received packets up to the timestamp fields\n"
 	       "  --test    Send 10000 warmup packets, then run traffic for 10 seconds, wait 2 second, then exit\n"
-	       "  --latency Enable latency tracking and histogram (default: disabled)\n",
-	       prog, DEFAULT_PAYLOAD_LEN, (unsigned int)MAX_PAYLOAD_LEN);
+	       "  --latency Enable latency tracking and histogram (default: disabled)\n"
+	       "  --periodic-burst  Send %u packets (%u-byte payload) as a burst at the start of\n"
+	       "                    each %u us window; no traffic for the rest of the window.\n"
+	       "                    Implies --payload-len %u (override with --payload-len after).\n"
+	       "  --poisson-rate    Re-sample TX rate every %u us from Poisson(mean=%llu pps);\n"
+	       "                    packets are paced evenly across each interval.\n",
+	       prog, DEFAULT_PAYLOAD_LEN, (unsigned int)MAX_PAYLOAD_LEN,
+	       (unsigned int)PERIODIC_BURST_COUNT, (unsigned int)PERIODIC_BURST_PAYLOAD_LEN,
+	       (unsigned int)PERIODIC_BURST_INTERVAL_US, (unsigned int)PERIODIC_BURST_PAYLOAD_LEN,
+	       (unsigned int)POISSON_RATE_INTERVAL_US, (unsigned long long)POISSON_RATE_MEAN_PPS);
 }
 
 int main(int argc, char *argv[])
@@ -850,13 +1012,15 @@ int main(int argc, char *argv[])
 		{"range",       no_argument,       NULL, 'r'},
 		{"debug",       no_argument,       NULL, 'd'},
 		{"test",        no_argument,       NULL, 't'},
-		{"latency",     no_argument,       NULL, 'l'},
-		{"help",        no_argument,       NULL, 'h'},
-		{NULL,           0,                 NULL,  0 }
+		{"latency",        no_argument,       NULL, 'l'},
+		{"periodic-burst", no_argument,       NULL, 'b'},
+		{"poisson-rate",   no_argument,       NULL, 'P'},
+		{"help",           no_argument,       NULL, 'h'},
+		{NULL,              0,                 NULL,  0 }
 	};
 
 	int opt;
-	while ((opt = getopt_long(argc, argv, "p:c:s:rdtlh", long_options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "p:c:s:rdtlbPh", long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'p':
 			target_pps = strtoull(optarg, NULL, 10);
@@ -884,6 +1048,13 @@ int main(int argc, char *argv[])
 			break;
 		case 'l':
 			latency_mode = 1;
+			break;
+		case 'b':
+			periodic_burst_mode = 1;
+			payload_len = PERIODIC_BURST_PAYLOAD_LEN;
+			break;
+		case 'P':
+			poisson_rate_mode = 1;
 			break;
 		case 'h':
 		default:
