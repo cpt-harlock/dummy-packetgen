@@ -35,7 +35,7 @@
 #define TEST_WARMUP_PACKETS 5000
 
 /* Periodic-burst mode parameters */
-#define PERIODIC_BURST_COUNT       2048   /* packets per burst */
+#define PERIODIC_BURST_COUNT       256/* packets per burst */
 #define PERIODIC_BURST_PAYLOAD_LEN  512   /* UDP payload bytes */
 #define PERIODIC_BURST_INTERVAL_US 1000   /* burst period in microseconds */
 
@@ -857,11 +857,15 @@ static int tx_loop(void *arg)
 
 		if (periodic_burst_mode) {
 			/* If the current burst is exhausted, idle until the next period. */
+			// Unlikely macro
 			if (pb_remaining == 0) {
 				if (rte_rdtsc() < pb_next_burst)
 					goto stats;
-				pb_next_burst += pb_ticks_per_interval;
+				pb_next_burst = rte_rdtsc() + pb_ticks_per_interval;
+				//pb_next_burst += pb_ticks_per_interval;
 				pb_remaining   = PERIODIC_BURST_COUNT;
+				// Consider also the number of tx cores here to avoid bursts from different cores bunching up together.
+				//pb_remaining  /= nb_tx_lcores;
 			}
 
 			uint16_t burst = (uint16_t)RTE_MIN((uint64_t)BURST_SIZE, pb_remaining);
