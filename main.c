@@ -500,7 +500,7 @@ static int rx_loop(void *arg)
 			struct rte_mbuf *m = bufs[i];
 
 			/* Need at least 47 bytes to read both timestamps */
-			if (latency_mode && rte_pktmbuf_data_len(m) >= 47) {
+			if (latency_mode && rte_pktmbuf_data_len(m) >= 51) {
 				uint8_t *pkt = rte_pktmbuf_mtod(m, uint8_t *);
 
 				if (debug_mode) {
@@ -518,13 +518,13 @@ static int rx_loop(void *arg)
 
 				uint32_t rx_timestamp;
 				uint32_t tx_timestamp;
-				memcpy(&rx_timestamp, pkt + 39, sizeof(uint32_t));
-				memcpy(&tx_timestamp, pkt + 43, sizeof(uint32_t));
+				memcpy(&rx_timestamp, pkt + 43, sizeof(uint32_t));
+				memcpy(&tx_timestamp, pkt + 47, sizeof(uint32_t));
 				uint32_t latency = tx_timestamp - rx_timestamp;
 
 				if (debug_mode) {
-					printf("[RX-DBG]   rx_ts=%u (off 39)  "
-					       "tx_ts=%u (off 43)  "
+					printf("[RX-DBG]   rx_ts=%u (off 43)  "
+					       "tx_ts=%u (off 47)  "
 					       "latency=%u\n",
 					       rx_timestamp, tx_timestamp, latency);
 				}
