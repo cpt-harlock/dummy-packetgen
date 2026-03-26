@@ -50,7 +50,7 @@
 #define DST_IP    RTE_IPV4(10, 0, 0, 2)
 #define SRC_PORT  12345
 #define DST_PORT  54321
-#define DEFAULT_PAYLOAD_LEN 64
+#define DEFAULT_PAYLOAD_LEN 0
 #define MAX_PAYLOAD_LEN (UINT16_MAX - sizeof(struct rte_ipv4_hdr) - sizeof(struct rte_udp_hdr))
 
 /* Histogram parameters */
@@ -818,12 +818,15 @@ static int tx_loop(void *arg)
 
 	/* Periodic-burst state */
 	uint64_t pb_next_burst = rte_rdtsc();
-	uint64_t pb_remaining  = PERIODIC_BURST_COUNT;
+	uint64_t pb_burst_count = PERIODIC_BURST_COUNT / RTE_MAX((uint64_t)1, (uint64_t)nb_tx_lcores);
+	if (pb_burst_count == 0)
+		pb_burst_count = 1;
+	uint64_t pb_remaining  = pb_burst_count;
 	uint64_t pb_ticks_per_interval = hz * PERIODIC_BURST_INTERVAL_US / 1000000ULL;
 	if (periodic_burst_mode)
-		printf("[TX] q%u periodic-burst mode: %u pkts every %u us\n",
+		printf("[TX] q%u periodic-burst mode: %" PRIu64 " pkts every %u us\n",
 		       ctx->queue_id,
-		       (unsigned int)PERIODIC_BURST_COUNT,
+		       pb_burst_count,
 		       (unsigned int)PERIODIC_BURST_INTERVAL_US);
 
 	/* Poisson-rate state */
