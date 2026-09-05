@@ -14,3 +14,7 @@ m_dep = cc.find_library('m', required : false)
 executable('packetgenlatency',
     sources: ['main.c'],
     dependencies: [dpdk_dep,m_dep])
+
+executable('packetgenmica',
+    sources: ['main_mica.c'],
+    dependencies: [dpdk_dep,m_dep])
