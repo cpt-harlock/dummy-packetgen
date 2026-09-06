@@ -27,7 +27,7 @@
 
 #define RX_RING_SIZE    1024
 #define TX_RING_SIZE    1024
-#define NUM_MBUFS       8191
+#define NUM_MBUFS       32767
 #define MBUF_CACHE      250
 #define BURST_SIZE      64     /* larger bursts amortise per-burst overhead */
 #define PREFETCH_OFFSET  3     /* prefetch this many packets ahead */
@@ -68,6 +68,7 @@
  */
 static struct rte_ring *work_rings[MAX_RX_QUEUES];
 static int pipeline_mode;
+static uint32_t idx = 0;
 
 /* Per-RX-queue context: packet counter and per-lcore histogram. */
 struct rx_ctx {
@@ -415,6 +416,7 @@ static int preload_tx_pool(void)
  */
 inline static void fill_packet(struct rte_mbuf *m, uint32_t dst_ip)
 {
+
 	m->data_len = template_pkt_len;
 	m->pkt_len  = template_pkt_len;
 
@@ -424,6 +426,8 @@ inline static void fill_packet(struct rte_mbuf *m, uint32_t dst_ip)
 					  (pkt + sizeof(struct rte_ether_hdr));
 		ip->dst_addr     = rte_cpu_to_be_32(dst_ip);
 		ip->hdr_checksum = rte_ipv4_cksum(ip);
+                *(uint32_t*)(pkt) = idx++;
+                *(uint32_t*)(pkt+60) = idx++;
 	}
 }
 
@@ -508,7 +512,7 @@ static int rx_loop(void *arg)
 					       "first 47 bytes:\n",
 					       queue, ctx->rx_total,
 					       rte_pktmbuf_data_len(m));
-					for (int b = 0; b < 47; b++) {
+					for (int b = 0; b < 64; b++) {
 						printf("%02x ", pkt[b]);
 						if ((b & 0xf) == 0xf)
 							printf("\n");
@@ -670,8 +674,8 @@ static int worker_lcore(void *arg)
 
 				uint32_t rx_timestamp;
 				uint32_t tx_timestamp;
-				memcpy(&rx_timestamp, pkt + 39, sizeof(uint32_t));
-				memcpy(&tx_timestamp, pkt + 43, sizeof(uint32_t));
+				memcpy(&rx_timestamp, pkt + 43, sizeof(uint32_t));
+				memcpy(&tx_timestamp, pkt + 47, sizeof(uint32_t));
 				uint32_t latency = tx_timestamp - rx_timestamp;
 
 				if (debug_mode) {
