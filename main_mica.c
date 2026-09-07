@@ -130,6 +130,11 @@ static uint16_t template_pkt_len;
 /* Debug mode: dump raw bytes of each received packet */
 static int debug_mode;
 
+/* Quiet mode: suppress every printf() except the final "[STATS] Packet
+ * diff ..." line and the SUCCESS/FAIL "final diff=..." line right after
+ * it -- the two lines a caller actually needs to parse programmatically. */
+static int quiet_mode;
+
 /* Latency / histogram mode: disabled by default */
 static int latency_mode;
 
@@ -305,7 +310,8 @@ static void hist_dump(const char *filename)
 {
 	FILE *f = fopen(filename, "w");
 	if (!f) {
-		printf("Failed to open %s for writing\n", filename);
+		if (!quiet_mode)
+			printf("Failed to open %s for writing\n", filename);
 		return;
 	}
 
@@ -323,12 +329,13 @@ static void hist_dump(const char *filename)
 			HIST_NUM_BINS * HIST_BIN_WIDTH, hist_overflow);
 	fclose(f);
 
-	printf("[HIST] %" PRIu64 " samples written to %s  "
-	       "(min=%u max=%u overflow=%" PRIu64 ")\n",
-	       hist_total, filename,
-	       hist_global_min, hist_global_max, hist_overflow);
+	if (!quiet_mode)
+		printf("[HIST] %" PRIu64 " samples written to %s  "
+		       "(min=%u max=%u overflow=%" PRIu64 ")\n",
+		       hist_total, filename,
+		       hist_global_min, hist_global_max, hist_overflow);
 
-	if (hist_total > 0) {
+	if (hist_total > 0 && !quiet_mode) {
 		int p50_overflow;
 		int p99_overflow;
 		int p999_overflow;
@@ -368,8 +375,9 @@ static int port_init(uint16_t port, uint16_t *nb_rx_queues, uint16_t *nb_tx_queu
 
 	ret = rte_eth_dev_info_get(port, &dev_info);
 	if (ret != 0) {
-		printf("Error getting device info for port %u: %s\n",
-		       port, rte_strerror(-ret));
+		if (!quiet_mode)
+			printf("Error getting device info for port %u: %s\n",
+			       port, rte_strerror(-ret));
 		return ret;
 	}
 
@@ -417,7 +425,7 @@ static int port_init(uint16_t port, uint16_t *nb_rx_queues, uint16_t *nb_tx_queu
 		return ret;
 
 	ret = rte_eth_promiscuous_enable(port);
-	if (ret != 0) {
+	if (ret != 0 && !quiet_mode) {
 		printf("Warning: promiscuous mode enable failed for port %u: %s\n",
 		       port, rte_strerror(-ret));
 	}
@@ -646,9 +654,11 @@ static int rx_loop(void *arg)
 		ctx->hist_max = 0;
 	}
 
-	printf("[RX] lcore %u polling queue %u\n", rte_lcore_id(), queue);
-	if (!latency_mode)
-		printf("[RX] Latency/histogram tracking disabled\n");
+	if (!quiet_mode) {
+		printf("[RX] lcore %u polling queue %u\n", rte_lcore_id(), queue);
+		if (!latency_mode)
+			printf("[RX] Latency/histogram tracking disabled\n");
+	}
 
 	while (keep_running) {
 		uint16_t nb_rx = rte_eth_rx_burst(0, queue, bufs, BURST_SIZE);
@@ -672,7 +682,7 @@ static int rx_loop(void *arg)
 			if (latency_mode && rte_pktmbuf_data_len(m) >= 51) {
 				uint8_t *pkt = rte_pktmbuf_mtod(m, uint8_t *);
 
-				if (debug_mode) {
+				if (debug_mode && !quiet_mode) {
 					printf("[RX-DBG] q%u pkt #%"PRIu64" (%u bytes) "
 					       "first 47 bytes:\n",
 					       queue, ctx->rx_total,
@@ -691,7 +701,7 @@ static int rx_loop(void *arg)
 				memcpy(&tx_timestamp, pkt + 47, sizeof(uint32_t));
 				uint32_t latency = tx_timestamp - rx_timestamp;
 
-				if (debug_mode) {
+				if (debug_mode && !quiet_mode) {
 					printf("[RX-DBG]   rx_ts=%u (off 43)  "
 					       "tx_ts=%u (off 47)  "
 					       "latency=%u\n",
@@ -725,13 +735,15 @@ static int rx_loop(void *arg)
 		/* Print a summary every second */
 		uint64_t now = rte_rdtsc();
 		if (now - last_print >= hz) {
-			if (latency_mode && lat_count > 0) {
-				printf("[RX] q%u total=%'lu  interval_pkts=%"PRIu64
-				       "  latency min=%u avg=%"PRIu64" max=%u\n",
-				       queue, ctx->rx_total, lat_count,
-				       lat_min, lat_sum / lat_count, lat_max);
-			} else {
-				printf("[RX] q%u total=%'lu\n", queue, ctx->rx_total);
+			if (!quiet_mode) {
+				if (latency_mode && lat_count > 0) {
+					printf("[RX] q%u total=%'lu  interval_pkts=%"PRIu64
+					       "  latency min=%u avg=%"PRIu64" max=%u\n",
+					       queue, ctx->rx_total, lat_count,
+					       lat_min, lat_sum / lat_count, lat_max);
+				} else {
+					printf("[RX] q%u total=%'lu\n", queue, ctx->rx_total);
+				}
 			}
 			last_print = now;
 			lat_sum = 0;
@@ -741,7 +753,8 @@ static int rx_loop(void *arg)
 		}
 	}
 
-	printf("[RX] q%u total packets received: %'lu\n", queue, ctx->rx_total);
+	if (!quiet_mode)
+		printf("[RX] q%u total packets received: %'lu\n", queue, ctx->rx_total);
 	return 0;
 }
 
@@ -764,7 +777,8 @@ static int io_lcore(void *arg)
 	struct rte_ring *ring = work_rings[queue];
 	struct rte_mbuf *bufs[BURST_SIZE];
 
-	printf("[IO] lcore %u draining queue %u → ring\n", rte_lcore_id(), queue);
+	if (!quiet_mode)
+		printf("[IO] lcore %u draining queue %u → ring\n", rte_lcore_id(), queue);
 
 	while (keep_running) {
 		uint16_t nb_rx = rte_eth_rx_burst(0, queue, bufs, BURST_SIZE);
@@ -799,7 +813,8 @@ static int worker_lcore(void *arg)
 		ctx->hist_max = 0;
 	}
 
-	printf("[WORKER] lcore %u processing queue %u\n", rte_lcore_id(), queue);
+	if (!quiet_mode)
+		printf("[WORKER] lcore %u processing queue %u\n", rte_lcore_id(), queue);
 
 	/* Drain the ring even after keep_running clears so we don't leak mbufs. */
 	while (keep_running || rte_ring_count(ring) > 0) {
@@ -824,7 +839,7 @@ static int worker_lcore(void *arg)
 			if (latency_mode && rte_pktmbuf_data_len(m) >= 47) {
 				uint8_t *pkt = rte_pktmbuf_mtod(m, uint8_t *);
 
-				if (debug_mode) {
+				if (debug_mode && !quiet_mode) {
 					printf("[RX-DBG] q%u pkt #%"PRIu64" (%u bytes) "
 					       "first 47 bytes:\n",
 					       queue, ctx->rx_total,
@@ -843,7 +858,7 @@ static int worker_lcore(void *arg)
 				memcpy(&tx_timestamp, pkt + 47, sizeof(uint32_t));
 				uint32_t latency = tx_timestamp - rx_timestamp;
 
-				if (debug_mode) {
+				if (debug_mode && !quiet_mode) {
 					printf("[RX-DBG]   rx_ts=%u (off 39)  "
 					       "tx_ts=%u (off 43)  "
 					       "latency=%u\n",
@@ -871,7 +886,7 @@ static int worker_lcore(void *arg)
 
 		uint64_t now = rte_rdtsc();
 		if (now - last_print >= hz) {
-			if (latency_mode && lat_count > 0) {
+			if (latency_mode && lat_count > 0 && !quiet_mode) {
 				printf("[WORKER] q%u total=%'lu  interval_pkts=%"PRIu64
 				       "  latency min=%u avg=%"PRIu64" max=%u\n",
 				       queue, ctx->rx_total, lat_count,
@@ -885,7 +900,8 @@ static int worker_lcore(void *arg)
 		}
 	}
 
-	printf("[WORKER] q%u total packets processed: %'lu\n", queue, ctx->rx_total);
+	if (!quiet_mode)
+		printf("[WORKER] q%u total packets processed: %'lu\n", queue, ctx->rx_total);
 	return 0;
 }
 
@@ -942,16 +958,18 @@ static int tx_loop(void *arg)
 		if (per_core_pps == 0)
 			per_core_pps = 1;
 		ticks_per_burst = hz * BURST_SIZE / per_core_pps;
-		printf("[TX] q%u rate-limiting to ~%" PRIu64 " pps "
-		       "(burst interval ~%" PRIu64 " ticks)\n",
-		       ctx->queue_id,
-		       per_core_pps,
-		       ticks_per_burst);
-	} else {
+		if (!quiet_mode)
+			printf("[TX] q%u rate-limiting to ~%" PRIu64 " pps "
+			       "(burst interval ~%" PRIu64 " ticks)\n",
+			       ctx->queue_id,
+			       per_core_pps,
+			       ticks_per_burst);
+	} else if (!quiet_mode) {
 		printf("[TX] q%u sending at line rate (no pps limit)\n", ctx->queue_id);
 	}
 
-	printf("[TX] q%u running on lcore %u\n", ctx->queue_id, rte_lcore_id());
+	if (!quiet_mode)
+		printf("[TX] q%u running on lcore %u\n", ctx->queue_id, rte_lcore_id());
 
 	if (test_mode) {
 		uint64_t warmup_target = TEST_WARMUP_PACKETS / nb_tx_lcores;
@@ -980,8 +998,9 @@ static int tx_loop(void *arg)
 			tx_total += sent;
 		}
 
-		printf("[TEST] q%u warmup sent %" PRIu64 " packets\n",
-		       ctx->queue_id, warmup_sent);
+		if (!quiet_mode)
+			printf("[TEST] q%u warmup sent %" PRIu64 " packets\n",
+			       ctx->queue_id, warmup_sent);
 	}
 
 	start_tsc = rte_rdtsc();
@@ -995,7 +1014,7 @@ static int tx_loop(void *arg)
 		pb_burst_count = 1;
 	uint64_t pb_remaining  = pb_burst_count;
 	uint64_t pb_ticks_per_interval = hz * PERIODIC_BURST_INTERVAL_US / 1000000ULL;
-	if (periodic_burst_mode)
+	if (periodic_burst_mode && !quiet_mode)
 		printf("[TX] q%u periodic-burst mode: %" PRIu64 " pkts every %u us\n",
 		       ctx->queue_id,
 		       pb_burst_count,
@@ -1015,7 +1034,7 @@ static int tx_loop(void *arg)
 		  ((pr_interval_pkts + BURST_SIZE - 1) / BURST_SIZE)
 		: pr_ticks_per_interval;
 	uint64_t pr_next_send       = rte_rdtsc();
-	if (poisson_rate_mode)
+	if (poisson_rate_mode && !quiet_mode)
 		printf("[TX] q%u poisson-rate mode: mean %llu pps, "
 		       "re-sample every %u us (lambda=%.0f pkts/interval)\n",
 		       ctx->queue_id,
@@ -1025,7 +1044,8 @@ static int tx_loop(void *arg)
 
 	while (keep_running) {
 		if (test_mode && (rte_rdtsc() - start_tsc) >= (10 * hz)) {
-			printf("[TEST] 10 second run completed, stopping traffic\n");
+			if (!quiet_mode)
+				printf("[TEST] 10 second run completed, stopping traffic\n");
 			keep_running = 0;
 			break;
 		}
@@ -1128,15 +1148,17 @@ stats:
 		{
 			uint64_t now = rte_rdtsc();
 			if (now - last_print >= hz) {
-				printf("[TX] q%u sent %" PRIu64 " total packets\n",
-				       ctx->queue_id, tx_total);
+				if (!quiet_mode)
+					printf("[TX] q%u sent %" PRIu64 " total packets\n",
+					       ctx->queue_id, tx_total);
 				last_print = now;
 			}
 		}
 	}
 
-	printf("[TX] q%u total packets sent: %" PRIu64 "\n",
-	       ctx->queue_id, tx_total);
+	if (!quiet_mode)
+		printf("[TX] q%u total packets sent: %" PRIu64 "\n",
+		       ctx->queue_id, tx_total);
 	ctx->tx_total = tx_total;
 	return 0;
 }
@@ -1146,7 +1168,7 @@ static void usage(const char *prog)
 	printf("Usage: %s [EAL options] -- [--pps <packets/sec>] [--tx-cores <count>] "
 	       "[--mica-size tiny|small] [--mica-get-pct <0-100>] [--mica-db-size <N>] "
 	       "[--mica-zipf-theta <0-1)>] [--range] [--debug] [--test] [--latency] "
-	       "[--periodic-burst] [--poisson-rate]\n"
+	       "[--periodic-burst] [--poisson-rate] [--quiet]\n"
 	       "  --pps N   Target TX rate in packets per second (0 = line rate, default)\n"
 	       "  --tx-cores N   Number of lcores used for TX (includes main lcore, default: 1)\n"
 	       "  --mica-size tiny|small   MICA key/value size class (default: tiny; "
@@ -1161,7 +1183,9 @@ static void usage(const char *prog)
 	       "  --periodic-burst  Send %u packets as a burst at the start of each %u us window;\n"
 	       "                    no traffic for the rest of the window.\n"
 	       "  --poisson-rate    Re-sample TX rate every %u us from Poisson(mean=%llu pps);\n"
-	       "                    packets are paced evenly across each interval.\n",
+	       "                    packets are paced evenly across each interval.\n"
+	       "  --quiet   Suppress all output except the final \"[STATS] Packet diff\" "
+	       "line and the SUCCESS/FAIL line right after it.\n",
 	       prog,
 	       (unsigned int)TINY_KEY_SIZE, (unsigned int)TINY_VALUE_SIZE,
 	       (unsigned int)SMALL_KEY_SIZE, (unsigned int)SMALL_VALUE_SIZE,
@@ -1204,12 +1228,13 @@ int main(int argc, char *argv[])
 		{"latency",         no_argument,       NULL, 'l'},
 		{"periodic-burst",  no_argument,       NULL, 'b'},
 		{"poisson-rate",    no_argument,       NULL, 'P'},
+		{"quiet",           no_argument,       NULL, 'q'},
 		{"help",            no_argument,       NULL, 'h'},
 		{NULL,              0,                 NULL,  0 }
 	};
 
 	int opt;
-	while ((opt = getopt_long(argc, argv, "p:c:z:g:D:Z:rdtlbPh", long_options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "p:c:z:g:D:Z:rdtlbPqh", long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'p':
 			target_pps = strtoull(optarg, NULL, 10);
@@ -1265,6 +1290,9 @@ int main(int argc, char *argv[])
 		case 'P':
 			poisson_rate_mode = 1;
 			break;
+		case 'q':
+			quiet_mode = 1;
+			break;
 		case 'h':
 		default:
 			usage(argv[0]);
@@ -1304,18 +1332,20 @@ int main(int argc, char *argv[])
 	if (nb_ports == 0)
 		rte_exit(EXIT_FAILURE, "No Ethernet ports available\n");
 
-	printf("Using port %u (of %u available)\n", port_id, nb_ports);
-	printf("MICA size class: %s (key=%uB value=%uB, GET payload=%uB SET payload=%uB)\n",
-	       mica_use_small ? "small" : "tiny",
-	       mica_key_size, mica_value_size,
-	       mica_get_payload_len, mica_set_payload_len);
-	printf("MICA workload: get-pct=%u%%  db-size=%" PRIu64 "  zipf-theta=%.3f\n",
-	       mica_get_pct, mica_db_size, mica_zipf_theta);
-	printf("Destination IP range mode: %s\n",
-	       range_mode ? "enabled (varying low 16 bits)" : "disabled");
-	printf("Latency / histogram tracking: %s\n",
-	       latency_mode ? "enabled" : "disabled");
-	printf("TX lcores requested: %u\n", tx_cores);
+	if (!quiet_mode) {
+		printf("Using port %u (of %u available)\n", port_id, nb_ports);
+		printf("MICA size class: %s (key=%uB value=%uB, GET payload=%uB SET payload=%uB)\n",
+		       mica_use_small ? "small" : "tiny",
+		       mica_key_size, mica_value_size,
+		       mica_get_payload_len, mica_set_payload_len);
+		printf("MICA workload: get-pct=%u%%  db-size=%" PRIu64 "  zipf-theta=%.3f\n",
+		       mica_get_pct, mica_db_size, mica_zipf_theta);
+		printf("Destination IP range mode: %s\n",
+		       range_mode ? "enabled (varying low 16 bits)" : "disabled");
+		printf("Latency / histogram tracking: %s\n",
+		       latency_mode ? "enabled" : "disabled");
+		printf("TX lcores requested: %u\n", tx_cores);
+	}
 
 	/* Collect all worker lcores and reserve N-1 workers for TX (main is TX core 0). */
 	uint16_t nb_worker_lcores = 0;
@@ -1382,8 +1412,10 @@ int main(int argc, char *argv[])
 	memset(rx_ctxs, 0, sizeof(rx_ctxs));
 	for (uint16_t q = 0; q < nb_rx_queues; q++)
 		rx_ctxs[q].queue_id = q;
-	printf("Using %u RX queue(s)\n", nb_rx_queues);
-	printf("Using %u TX queue(s)\n", nb_tx_lcores);
+	if (!quiet_mode) {
+		printf("Using %u RX queue(s)\n", nb_rx_queues);
+		printf("Using %u TX queue(s)\n", nb_tx_lcores);
+	}
 
 	/* Initialise TX contexts (queue 0 runs on main lcore). */
 	memset(tx_ctxs, 0, sizeof(tx_ctxs));
@@ -1414,18 +1446,21 @@ int main(int argc, char *argv[])
 			rte_eal_remote_launch(io_lcore,     &rx_ctxs[q], worker_lcores[rx_worker_offset + q * 2]);
 			rte_eal_remote_launch(worker_lcore, &rx_ctxs[q], worker_lcores[rx_worker_offset + q * 2 + 1]);
 		}
-		printf("Pipeline mode: launched %u queue(s) × (1 IO + 1 worker) lcore\n",
-		       nb_rx_queues);
+		if (!quiet_mode)
+			printf("Pipeline mode: launched %u queue(s) × (1 IO + 1 worker) lcore\n",
+			       nb_rx_queues);
 	} else {
 		/* Single-lcore mode (optimised rx_loop with prefetch). */
 		for (uint16_t q = 0; q < nb_rx_queues && q < nb_rx_worker_lcores; q++)
 			rte_eal_remote_launch(rx_loop, &rx_ctxs[q], worker_lcores[rx_worker_offset + q]);
 
-		if (nb_rx_worker_lcores == 0)
-			printf("Warning: no secondary lcore available; RX disabled. "
-			       "Run with more lcores or lower --tx-cores\n");
-		else
-			printf("Single-lcore mode: launched %u RX lcore(s)\n", nb_rx_queues);
+		if (!quiet_mode) {
+			if (nb_rx_worker_lcores == 0)
+				printf("Warning: no secondary lcore available; RX disabled. "
+				       "Run with more lcores or lower --tx-cores\n");
+			else
+				printf("Single-lcore mode: launched %u RX lcore(s)\n", nb_rx_queues);
+		}
 	}
 
 	rte_delay_ms(1000);
@@ -1438,7 +1473,8 @@ int main(int argc, char *argv[])
 	tx_loop(&tx_ctxs[0]);
 
 	if (test_mode) {
-		printf("[TEST] Waiting 2 seconds before exit\n");
+		if (!quiet_mode)
+			printf("[TEST] Waiting 2 seconds before exit\n");
 		rte_delay_ms(2000);
 	}
 
