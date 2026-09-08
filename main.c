@@ -34,10 +34,12 @@
 #define WORK_RING_SIZE  4096   /* per-queue SPSC ring depth; must be power of 2 */
 #define TEST_WARMUP_PACKETS 5000
 
-/* Periodic-burst mode parameters */
-#define PERIODIC_BURST_COUNT       256/* packets per burst */
-#define PERIODIC_BURST_PAYLOAD_LEN  512   /* UDP payload bytes */
-#define PERIODIC_BURST_INTERVAL_US 1000   /* burst period in microseconds */
+/* Periodic-burst mode parameters (defaults; all overridable on the CLI) */
+#define PERIODIC_BURST_COUNT       256    /* packets per burst */
+#define PERIODIC_BURST_INTERVAL_US 1000   /* period between bursts, in microseconds */
+#define PERIODIC_BURST_RATE        0      /* pps used to pace packets within a burst; 0 = as fast as possible */
+#define PERIODIC_BURST_LINE_RATE_PPS 144000000ULL /* assumed max rate ("as fast as possible") used to
+						    * validate the burst config when --burst-rate=0 */
 
 /* Poisson-rate mode parameters */
 #define POISSON_RATE_MEAN_PPS    10000000ULL  /* mean rate: 10 Mpps */
@@ -107,9 +109,13 @@ static int latency_mode;
 /* Test mode */
 static int test_mode;
 
-/* Periodic-burst mode: send PERIODIC_BURST_COUNT packets at start of each 1 ms,
- * then stay idle for the remainder of the interval. */
+/* Periodic-burst mode: send a burst of packets at the start of each period,
+ * then stay idle for the remainder of the period. Packet size comes from
+ * --payload-len; burst size, period, and internal rate are configurable. */
 static int periodic_burst_mode;
+static uint64_t burst_pkt_count  = PERIODIC_BURST_COUNT;      /* total packets per burst */
+static uint64_t burst_period_us  = PERIODIC_BURST_INTERVAL_US;/* time between successive bursts (us) */
+static uint64_t burst_rate_pps   = PERIODIC_BURST_RATE;       /* pacing rate within a burst; 0 = unlimited */
 
 /* Poisson-rate mode: re-sample TX rate every POISSON_RATE_INTERVAL_US from a
  * Poisson distribution with mean POISSON_RATE_MEAN_PPS, then pace that many
@@ -443,6 +449,20 @@ static int parse_payload_len(const char *arg, uint16_t *value)
 		return -1;
 
 	*value = (uint16_t)parsed;
+	return 0;
+}
+
+/* Generic base-10 uint64 parser used by the burst-mode options. */
+static int parse_u64(const char *arg, uint64_t *value)
+{
+	char *end = NULL;
+	unsigned long long parsed;
+
+	parsed = strtoull(arg, &end, 10);
+	if (arg[0] == '\0' || end == arg || *end != '\0')
+		return -1;
+
+	*value = (uint64_t)parsed;
 	return 0;
 }
 
@@ -822,16 +842,27 @@ static int tx_loop(void *arg)
 
 	/* Periodic-burst state */
 	uint64_t pb_next_burst = rte_rdtsc();
-	uint64_t pb_burst_count = PERIODIC_BURST_COUNT / RTE_MAX((uint64_t)1, (uint64_t)nb_tx_lcores);
+	uint64_t pb_burst_count = burst_pkt_count / RTE_MAX((uint64_t)1, (uint64_t)nb_tx_lcores);
 	if (pb_burst_count == 0)
 		pb_burst_count = 1;
 	uint64_t pb_remaining  = pb_burst_count;
-	uint64_t pb_ticks_per_interval = hz * PERIODIC_BURST_INTERVAL_US / 1000000ULL;
+	uint64_t pb_ticks_per_interval = hz * burst_period_us / 1000000ULL;
+	/* Pace packets within a burst at burst_rate_pps (0 = send as fast as possible). */
+	uint64_t pb_per_core_rate = burst_rate_pps / RTE_MAX((uint64_t)1, (uint64_t)nb_tx_lcores);
+	uint64_t pb_ticks_per_chunk = 0;
+	if (burst_rate_pps > 0) {
+		if (pb_per_core_rate == 0)
+			pb_per_core_rate = 1;
+		pb_ticks_per_chunk = hz * BURST_SIZE / pb_per_core_rate;
+	}
+	uint64_t pb_next_send = rte_rdtsc();
 	if (periodic_burst_mode)
-		printf("[TX] q%u periodic-burst mode: %" PRIu64 " pkts every %u us\n",
+		printf("[TX] q%u periodic-burst mode: %" PRIu64 " pkts every %" PRIu64 " us"
+		       " (%s)\n",
 		       ctx->queue_id,
 		       pb_burst_count,
-		       (unsigned int)PERIODIC_BURST_INTERVAL_US);
+		       burst_period_us,
+		       burst_rate_pps > 0 ? "rate-limited within burst" : "sent as fast as possible");
 
 	/* Poisson-rate state */
 	uint64_t pr_ticks_per_interval = hz * POISSON_RATE_INTERVAL_US / 1000000ULL;
@@ -870,9 +901,15 @@ static int tx_loop(void *arg)
 					goto stats;
 				pb_next_burst = rte_rdtsc() + pb_ticks_per_interval;
 				//pb_next_burst += pb_ticks_per_interval;
-				pb_remaining   = PERIODIC_BURST_COUNT;
-				// Consider also the number of tx cores here to avoid bursts from different cores bunching up together.
-				//pb_remaining  /= nb_tx_lcores;
+				pb_remaining   = pb_burst_count;
+				pb_next_send   = rte_rdtsc();
+			}
+
+			/* Pace sends within the burst, if a rate limit was requested. */
+			if (pb_ticks_per_chunk > 0) {
+				if (rte_rdtsc() < pb_next_send)
+					goto stats;
+				pb_next_send += pb_ticks_per_chunk;
 			}
 
 			uint16_t burst = (uint16_t)RTE_MIN((uint64_t)BURST_SIZE, pb_remaining);
@@ -979,7 +1016,8 @@ stats:
 
 static void usage(const char *prog)
 {
-	printf("Usage: %s [EAL options] -- [--pps <packets/sec>] [--tx-cores <count>] [--payload-len <bytes>] [--range] [--debug] [--test] [--latency] [--periodic-burst] [--poisson-rate]\n"
+	printf("Usage: %s [EAL options] -- [--pps <packets/sec>] [--tx-cores <count>] [--payload-len <bytes>] [--range] [--debug] [--test] [--latency]\n"
+	       "                            [--periodic-burst [--burst-count <n>] [--burst-period <us>] [--burst-rate <pps>]] [--poisson-rate]\n"
 	       "  --pps N   Target TX rate in packets per second (0 = line rate, default)\n"
 	       "  --tx-cores N   Number of lcores used for TX (includes main lcore, default: 1)\n"
 	       "  --payload-len N   UDP payload size in bytes (default: %u, max: %u)\n"
@@ -987,14 +1025,25 @@ static void usage(const char *prog)
 	       "  --debug   Hex-dump received packets up to the timestamp fields\n"
 	       "  --test    Send 10000 warmup packets, then run traffic for 10 seconds, wait 2 second, then exit\n"
 	       "  --latency Enable latency tracking and histogram (default: disabled)\n"
-	       "  --periodic-burst  Send %u packets (%u-byte payload) as a burst at the start of\n"
-	       "                    each %u us window; no traffic for the rest of the window.\n"
-	       "                    Implies --payload-len %u (override with --payload-len after).\n"
+	       "  --periodic-burst  Enable periodic-burst mode: send a burst of packets at the\n"
+	       "                    start of each period, then stay idle for the rest of it.\n"
+	       "                    Packet size is set with --payload-len.\n"
+	       "  --burst-count N   Packets per burst (default: %u)\n"
+	       "  --burst-period N  Time between the start of successive bursts, in\n"
+	       "                    microseconds (default: %u)\n"
+	       "  --burst-rate N    Rate, in packets/sec, used to pace packets within a\n"
+	       "                    burst (default: %u = send the burst as fast as possible,\n"
+	       "                    validated against an assumed %llu pps line rate).\n"
+	       "                    Startup fails if sending --burst-count packets at\n"
+	       "                    --burst-rate (or the assumed line rate, if 0) would\n"
+	       "                    take longer than --burst-period.\n"
 	       "  --poisson-rate    Re-sample TX rate every %u us from Poisson(mean=%llu pps);\n"
 	       "                    packets are paced evenly across each interval.\n",
 	       prog, DEFAULT_PAYLOAD_LEN, (unsigned int)MAX_PAYLOAD_LEN,
-	       (unsigned int)PERIODIC_BURST_COUNT, (unsigned int)PERIODIC_BURST_PAYLOAD_LEN,
-	       (unsigned int)PERIODIC_BURST_INTERVAL_US, (unsigned int)PERIODIC_BURST_PAYLOAD_LEN,
+	       (unsigned int)PERIODIC_BURST_COUNT,
+	       (unsigned int)PERIODIC_BURST_INTERVAL_US,
+	       (unsigned int)PERIODIC_BURST_RATE,
+	       (unsigned long long)PERIODIC_BURST_LINE_RATE_PPS,
 	       (unsigned int)POISSON_RATE_INTERVAL_US, (unsigned long long)POISSON_RATE_MEAN_PPS);
 }
 
@@ -1015,6 +1064,13 @@ int main(int argc, char *argv[])
 	argc -= ret;
 	argv += ret;
 
+	/* Long-only option values for the burst-mode parameters (no short form). */
+	enum {
+		OPT_BURST_COUNT = 1000,
+		OPT_BURST_PERIOD,
+		OPT_BURST_RATE,
+	};
+
 	/* --- Parse app-specific options (after "--") --- */
 	static struct option long_options[] = {
 		{"pps",         required_argument, NULL, 'p'},
@@ -1025,6 +1081,9 @@ int main(int argc, char *argv[])
 		{"test",        no_argument,       NULL, 't'},
 		{"latency",        no_argument,       NULL, 'l'},
 		{"periodic-burst", no_argument,       NULL, 'b'},
+		{"burst-count",  required_argument, NULL, OPT_BURST_COUNT},
+		{"burst-period", required_argument, NULL, OPT_BURST_PERIOD},
+		{"burst-rate",   required_argument, NULL, OPT_BURST_RATE},
 		{"poisson-rate",   no_argument,       NULL, 'P'},
 		{"help",           no_argument,       NULL, 'h'},
 		{NULL,              0,                 NULL,  0 }
@@ -1062,7 +1121,24 @@ int main(int argc, char *argv[])
 			break;
 		case 'b':
 			periodic_burst_mode = 1;
-			payload_len = PERIODIC_BURST_PAYLOAD_LEN;
+			break;
+		case OPT_BURST_COUNT:
+			if (parse_u64(optarg, &burst_pkt_count) != 0 || burst_pkt_count == 0)
+				rte_exit(EXIT_FAILURE,
+					 "Invalid --burst-count '%s' (expected a positive integer)\n",
+					 optarg);
+			break;
+		case OPT_BURST_PERIOD:
+			if (parse_u64(optarg, &burst_period_us) != 0 || burst_period_us == 0)
+				rte_exit(EXIT_FAILURE,
+					 "Invalid --burst-period '%s' (expected a positive integer, in microseconds)\n",
+					 optarg);
+			break;
+		case OPT_BURST_RATE:
+			if (parse_u64(optarg, &burst_rate_pps) != 0)
+				rte_exit(EXIT_FAILURE,
+					 "Invalid --burst-rate '%s' (expected a non-negative integer, in packets/sec)\n",
+					 optarg);
 			break;
 		case 'P':
 			poisson_rate_mode = 1;
@@ -1072,6 +1148,27 @@ int main(int argc, char *argv[])
 			usage(argv[0]);
 			return 0;
 		}
+	}
+
+	/* Burst mode: reject a configuration where sending burst_pkt_count packets
+	 * would take longer than burst_period_us. With burst_rate_pps == 0
+	 * ("as fast as possible") the actual rate is bounded by the NIC's line
+	 * rate, so the check falls back to an assumed PERIODIC_BURST_LINE_RATE_PPS
+	 * (144 Mpps) to still catch a burst that can't possibly fit in its period. */
+	if (periodic_burst_mode) {
+		uint64_t check_rate_pps = burst_rate_pps > 0
+			? burst_rate_pps : PERIODIC_BURST_LINE_RATE_PPS;
+		double burst_duration_us = (double)burst_pkt_count * 1e6 /
+					    (double)check_rate_pps;
+		if (burst_duration_us > (double)burst_period_us)
+			rte_exit(EXIT_FAILURE,
+				 "Invalid burst configuration: sending --burst-count=%" PRIu64
+				 " packets at %s%" PRIu64 " pps takes %.2f us, "
+				 "which exceeds --burst-period=%" PRIu64 " us\n",
+				 burst_pkt_count,
+				 burst_rate_pps > 0 ? "--burst-rate=" : "assumed line rate ",
+				 check_rate_pps, burst_duration_us,
+				 burst_period_us);
 	}
 
 	signal(SIGINT,  signal_handler);
@@ -1087,6 +1184,11 @@ int main(int argc, char *argv[])
 	       range_mode ? "enabled (varying low 16 bits)" : "disabled");
 	printf("Latency / histogram tracking: %s\n",
 	       latency_mode ? "enabled" : "disabled");
+	if (periodic_burst_mode)
+		printf("Periodic-burst mode: %" PRIu64 " pkts every %" PRIu64 " us "
+		       "(internal rate: %s)\n",
+		       burst_pkt_count, burst_period_us,
+		       burst_rate_pps > 0 ? "limited" : "as fast as possible");
 	printf("TX lcores requested: %u\n", tx_cores);
 
 	/* Collect all worker lcores and reserve N-1 workers for TX (main is TX core 0). */
