@@ -71,6 +71,12 @@
 #define SMALL_KEY_SIZE    16
 #define SMALL_VALUE_SIZE  32
 
+/* Smallest frame we may hand to the NIC, CRC excluded (the NIC appends the
+ * 4-byte FCS on the wire). Tiny/small MICA payloads are short enough that
+ * eth+ip+udp+payload can fall under this, producing "runt" frames that many
+ * switches drop on ingress -- pad the on-wire length up to this floor. */
+#define MIN_TX_FRAME_LEN  (RTE_ETHER_MIN_LEN - RTE_ETHER_CRC_LEN)
+
 /* Dummy packet parameters */
 #define DST_MAC   {0x00, 0x11, 0x22, 0x33, 0x44, 0x55}
 #define SRC_MAC   {0x00, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE}
@@ -562,6 +568,17 @@ inline static void fill_packet(struct tx_ctx *ctx, struct rte_mbuf *m, uint32_t 
 			memcpy(value + off, &r,
 			       RTE_MIN((size_t)(mica_value_size - off), sizeof(r)));
 		}
+	} else {
+		/* This mbuf's buffer may still hold a previous SET's value
+		 * bytes in the region between the GET payload and the padded
+		 * frame length (mica_get_frame_len >= this packet's actual
+		 * length; the pool never clears buffers between uses). Zero
+		 * that tail so it doesn't leak stale data as Ethernet
+		 * padding. */
+		uint16_t used = sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr) +
+				sizeof(struct rte_udp_hdr) + mica_get_payload_len;
+		if (frame_len > used)
+			memset(pkt + used, 0, frame_len - used);
 	}
 }
 
@@ -1315,6 +1332,16 @@ int main(int argc, char *argv[])
 			     sizeof(struct rte_udp_hdr) + mica_get_payload_len;
 	mica_set_frame_len = sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr) +
 			     sizeof(struct rte_udp_hdr) + mica_set_payload_len;
+
+	/* Pad the on-wire frame length only -- IP total_length/UDP dgram_len
+	 * below are computed from the unpadded payload sizes, since Ethernet
+	 * padding is not part of the IP datagram (RFC 894). The extra bytes
+	 * stay zeroed: init_packet_bytes() memsets the template up to
+	 * template_pkt_len before writing the headers/payload on top. */
+	if (mica_get_frame_len < MIN_TX_FRAME_LEN)
+		mica_get_frame_len = MIN_TX_FRAME_LEN;
+	if (mica_set_frame_len < MIN_TX_FRAME_LEN)
+		mica_set_frame_len = MIN_TX_FRAME_LEN;
 
 	mica_ip_total_len_get_be = rte_cpu_to_be_16(sizeof(struct rte_ipv4_hdr) +
 						     sizeof(struct rte_udp_hdr) +
