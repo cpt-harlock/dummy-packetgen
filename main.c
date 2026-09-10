@@ -33,6 +33,7 @@
 #define PREFETCH_OFFSET  3     /* prefetch this many packets ahead */
 #define WORK_RING_SIZE  4096   /* per-queue SPSC ring depth; must be power of 2 */
 #define TEST_WARMUP_PACKETS 5000
+#define TEST_DURATION_SEC 10   /* length of the timed run in --test mode */
 
 /* Periodic-burst mode parameters (defaults; all overridable on the CLI) */
 #define PERIODIC_BURST_COUNT       256    /* packets per burst */
@@ -887,8 +888,9 @@ static int tx_loop(void *arg)
 		       pr_lambda);
 
 	while (keep_running) {
-		if (test_mode && (rte_rdtsc() - start_tsc) >= (10 * hz)) {
-			printf("[TEST] 10 second run completed, stopping traffic\n");
+		if (test_mode && (rte_rdtsc() - start_tsc) >= (TEST_DURATION_SEC * hz)) {
+			printf("[TEST] %d second run completed, stopping traffic\n",
+			       TEST_DURATION_SEC);
 			keep_running = 0;
 			break;
 		}
@@ -1333,6 +1335,19 @@ int main(int argc, char *argv[])
 	       "  (sent=%" PRIu64 " received=%" PRIu64 ")\n",
 	       (int64_t)tx_total_global - (int64_t)rx_total_global,
 	       tx_total_global, rx_total_global);
+
+	{
+		/* Average received throughput over the run's timed window
+		 * (the fixed TEST_DURATION_SEC-second window in --test mode). */
+		double elapsed_sec = (double)TEST_DURATION_SEC;
+		double rx_mpps = (double)rx_total_global / elapsed_sec / 1e6;
+		double rx_gbps = (double)rx_total_global * template_pkt_len * 8.0 /
+				  elapsed_sec / 1e9;
+
+		printf("[STATS] Average received throughput: %.3f Mpps  (%.3f Gbps, "
+		       "%u-byte frames, %.0fs window)\n",
+		       rx_mpps, rx_gbps, template_pkt_len, elapsed_sec);
+	}
 
 	{
 		uint64_t sent = tx_total_global;
