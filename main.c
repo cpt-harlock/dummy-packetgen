@@ -98,6 +98,10 @@ static uint16_t tx_cores = 1;
 static uint16_t payload_len = DEFAULT_PAYLOAD_LEN;
 static int range_mode;
 
+/* Set when the NIC supports HW IPv4 checksum offload; lets fill_packet()
+ * skip the software rte_ipv4_cksum() recompute in --range mode. */
+static int ip_cksum_offload;
+
 /* Packet size used when preloading TX mbuf data buffers. */
 static uint16_t template_pkt_len;
 
@@ -156,6 +160,7 @@ static uint64_t poisson_sample(double lambda, uint64_t *rng_state)
 }
 static volatile uint64_t tx_total_global = 0;
 static volatile uint64_t rx_total_global = 0;
+static volatile uint64_t tx_post_warmup_global = 0;
 
 struct tx_ctx {
 	uint16_t  port_id;
@@ -163,6 +168,7 @@ struct tx_ctx {
 	uint16_t  stride;
 	uint64_t  packet_index;
 	uint64_t  tx_total;
+	uint64_t  tx_post_warmup;  /* packets sent after the warmup phase */
 };
 
 static struct tx_ctx tx_ctxs[MAX_WORKER_LCORES + 1];
@@ -277,6 +283,15 @@ static int port_init(uint16_t port, uint16_t *nb_rx_queues, uint16_t *nb_tx_queu
 
 	if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
 		port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
+
+	if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_IPV4_CKSUM) {
+		port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_IPV4_CKSUM;
+		ip_cksum_offload = 1;
+		printf("HW IPv4 checksum offload: enabled\n");
+	} else {
+		printf("HW IPv4 checksum offload: not supported by this device, "
+		       "falling back to software checksum\n");
+	}
 
 	/* Cap to what the device supports */
 	if (*nb_rx_queues > dev_info.max_rx_queues)
@@ -432,7 +447,14 @@ inline static void fill_packet(struct rte_mbuf *m, uint32_t dst_ip)
 		struct rte_ipv4_hdr *ip = (struct rte_ipv4_hdr *)
 					  (pkt + sizeof(struct rte_ether_hdr));
 		ip->dst_addr     = rte_cpu_to_be_32(dst_ip);
-		ip->hdr_checksum = rte_ipv4_cksum(ip);
+		if (ip_cksum_offload) {
+			ip->hdr_checksum = 0;
+			m->ol_flags |= RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_IP_CKSUM;
+			m->l2_len = sizeof(struct rte_ether_hdr);
+			m->l3_len = sizeof(struct rte_ipv4_hdr);
+		} else {
+			ip->hdr_checksum = rte_ipv4_cksum(ip);
+		}
                 *(uint32_t*)(pkt) = idx++;
                 *(uint32_t*)(pkt+60) = idx++;
 	}
@@ -779,6 +801,7 @@ static int tx_loop(void *arg)
 	struct tx_ctx *ctx = arg;
 	struct rte_mbuf *bufs[BURST_SIZE];
 	uint64_t tx_total = 0;
+	uint64_t post_warmup_sent = 0;  /* sent after warmup, i.e. during the timed window */
 	uint64_t packet_index = ctx->packet_index;
 	uint64_t start_tsc;
 	uint64_t last_print = rte_rdtsc();
@@ -928,6 +951,7 @@ static int tx_loop(void *arg)
 			for (uint16_t j = sent; j < burst; j++)
 				rte_pktmbuf_free(bufs[j]);
 			tx_total   += sent;
+			post_warmup_sent += sent;
 			pb_remaining -= burst;
 			goto stats;
 		}
@@ -972,6 +996,7 @@ static int tx_loop(void *arg)
 			for (uint16_t j = sent; j < burst; j++)
 				rte_pktmbuf_free(bufs[j]);
 			tx_total += sent;
+			post_warmup_sent += sent;
 			pr_sent_this_interval += sent;
 			goto stats;
 		}
@@ -997,6 +1022,7 @@ static int tx_loop(void *arg)
 		for (uint16_t j = sent; j < BURST_SIZE; j++)
 			rte_pktmbuf_free(bufs[j]);
 		tx_total += sent;
+		post_warmup_sent += sent;
 
 stats:
 		/* Print a summary every second */
@@ -1013,6 +1039,7 @@ stats:
 	printf("[TX] q%u total packets sent: %" PRIu64 "\n",
 	       ctx->queue_id, tx_total);
 	ctx->tx_total = tx_total;
+	ctx->tx_post_warmup = post_warmup_sent;
 	return 0;
 }
 
@@ -1221,11 +1248,23 @@ int main(int argc, char *argv[])
 	if (nb_rx_queues > MAX_RX_QUEUES)
 		nb_rx_queues = MAX_RX_QUEUES;
 
+	/* Allocate mbuf pools on the NIC's own NUMA node rather than the
+	 * calling (main) lcore's node -- otherwise every TX/RX descriptor
+	 * fetch and DMA can end up crossing sockets on multi-node systems. */
+	int pool_socket_id = rte_eth_dev_socket_id(port_id);
+	if (pool_socket_id == SOCKET_ID_ANY) {
+		printf("Warning: port %u reports no NUMA affinity, "
+		       "using calling lcore's socket for mbuf pools\n", port_id);
+		pool_socket_id = (int)rte_socket_id();
+	}
+	printf("Allocating mbuf pools on socket %d (port %u's NUMA node)\n",
+	       pool_socket_id, port_id);
+
 	/* --- Create RX/TX mbuf pools --- */
 	rx_mbuf_pool = rte_pktmbuf_pool_create("RX_MBUF_POOL", NUM_MBUFS * nb_ports,
 						MBUF_CACHE, 0,
 						RTE_MBUF_DEFAULT_BUF_SIZE,
-						rte_socket_id());
+						pool_socket_id);
 	if (rx_mbuf_pool == NULL)
 		rte_exit(EXIT_FAILURE, "Cannot create RX mbuf pool: %s\n",
 			 rte_strerror(rte_errno));
@@ -1233,7 +1272,7 @@ int main(int argc, char *argv[])
 	tx_mbuf_pool = rte_pktmbuf_pool_create("TX_MBUF_POOL", NUM_MBUFS * nb_ports,
 						MBUF_CACHE, 0,
 						RTE_MBUF_DEFAULT_BUF_SIZE,
-						rte_socket_id());
+						pool_socket_id);
 	if (tx_mbuf_pool == NULL)
 		rte_exit(EXIT_FAILURE, "Cannot create TX mbuf pool: %s\n",
 			 rte_strerror(rte_errno));
@@ -1328,8 +1367,11 @@ int main(int argc, char *argv[])
 
 	/* --- Merge per-lcore TX stats into globals --- */
 	tx_total_global = 0;
-	for (uint16_t i = 0; i < nb_tx_lcores; i++)
+	tx_post_warmup_global = 0;
+	for (uint16_t i = 0; i < nb_tx_lcores; i++) {
 		tx_total_global += tx_ctxs[i].tx_total;
+		tx_post_warmup_global += tx_ctxs[i].tx_post_warmup;
+	}
 
 	printf("[STATS] Packet diff (sent - received): %" PRId64
 	       "  (sent=%" PRIu64 " received=%" PRIu64 ")\n",
@@ -1347,6 +1389,16 @@ int main(int argc, char *argv[])
 		printf("[STATS] Average received throughput: %.3f Mpps  (%.3f Gbps, "
 		       "%u-byte frames, %.0fs window)\n",
 		       rx_mpps, rx_gbps, template_pkt_len, elapsed_sec);
+
+		/* Average sending throughput over the same window, excluding
+		 * the warmup packets sent before the timed window started. */
+		double tx_mpps = (double)tx_post_warmup_global / elapsed_sec / 1e6;
+		double tx_gbps = (double)tx_post_warmup_global * template_pkt_len * 8.0 /
+				  elapsed_sec / 1e9;
+
+		printf("[STATS] Average sending throughput: %.3f Mpps  (%.3f Gbps, "
+		       "%u-byte frames, %.0fs window)\n",
+		       tx_mpps, tx_gbps, template_pkt_len, elapsed_sec);
 	}
 
 	{

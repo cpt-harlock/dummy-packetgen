@@ -51,6 +51,7 @@
 #define PREFETCH_OFFSET  3     /* prefetch this many packets ahead */
 #define WORK_RING_SIZE  4096   /* per-queue SPSC ring depth; must be power of 2 */
 #define TEST_WARMUP_PACKETS 5000
+#define TEST_DURATION_SEC 10   /* length of the timed run in --test mode */
 
 /* Periodic-burst mode parameters */
 #define PERIODIC_BURST_COUNT       256    /* packets per burst */
@@ -130,6 +131,10 @@ static uint64_t target_pps;
 static uint16_t tx_cores = 1;
 static int range_mode;
 
+/* Set when the NIC supports HW IPv4 checksum offload; lets fill_packet()
+ * skip the software rte_ipv4_cksum() recompute on every packet. */
+static int ip_cksum_offload;
+
 /* Packet size used when preloading TX mbuf data buffers (worst case: SET). */
 static uint16_t template_pkt_len;
 
@@ -137,8 +142,10 @@ static uint16_t template_pkt_len;
 static int debug_mode;
 
 /* Quiet mode: suppress every printf() except the final "[STATS] Packet
- * diff ..." line and the SUCCESS/FAIL "final diff=..." line right after
- * it -- the two lines a caller actually needs to parse programmatically. */
+ * diff ...", "[STATS] Average received throughput ...",
+ * "[STATS] Average sending throughput ..." and SUCCESS/FAIL
+ * "final diff=..." lines -- the ones a caller actually needs to parse
+ * programmatically. */
 static int quiet_mode;
 
 /* Latency / histogram mode: disabled by default */
@@ -264,6 +271,7 @@ static struct zipf_gen mica_zipf;
 
 static volatile uint64_t tx_total_global = 0;
 static volatile uint64_t rx_total_global = 0;
+static volatile uint64_t tx_post_warmup_global = 0;
 
 struct tx_ctx {
 	uint16_t  port_id;
@@ -271,6 +279,7 @@ struct tx_ctx {
 	uint16_t  stride;
 	uint64_t  packet_index;
 	uint64_t  tx_total;
+	uint64_t  tx_post_warmup;  /* packets sent after the warmup phase */
 	uint64_t  rng_state;   /* per-lcore PRNG: op choice, key, value */
 };
 
@@ -389,6 +398,16 @@ static int port_init(uint16_t port, uint16_t *nb_rx_queues, uint16_t *nb_tx_queu
 
 	if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
 		port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
+
+	if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_IPV4_CKSUM) {
+		port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_IPV4_CKSUM;
+		ip_cksum_offload = 1;
+		if (!quiet_mode)
+			printf("HW IPv4 checksum offload: enabled\n");
+	} else if (!quiet_mode) {
+		printf("HW IPv4 checksum offload: not supported by this device, "
+		       "falling back to software checksum\n");
+	}
 
 	/* Cap to what the device supports */
 	if (*nb_rx_queues > dev_info.max_rx_queues)
@@ -550,8 +569,15 @@ inline static void fill_packet(struct tx_ctx *ctx, struct rte_mbuf *m, uint32_t 
 	if (range_mode)
 		ip->dst_addr = rte_cpu_to_be_32(dst_ip);
 
-	ip->hdr_checksum = 0;
-	ip->hdr_checksum = rte_ipv4_cksum(ip);
+	if (ip_cksum_offload) {
+		ip->hdr_checksum = 0;
+		m->ol_flags |= RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_IP_CKSUM;
+		m->l2_len = sizeof(struct rte_ether_hdr);
+		m->l3_len = sizeof(struct rte_ipv4_hdr);
+	} else {
+		ip->hdr_checksum = 0;
+		ip->hdr_checksum = rte_ipv4_cksum(ip);
+	}
 
 	/* --- MICA payload: opcode + key (+ value on SET) --- */
 	payload[0] = is_get ? mica_op_get : mica_op_set;
@@ -954,6 +980,7 @@ static int tx_loop(void *arg)
 	struct tx_ctx *ctx = arg;
 	struct rte_mbuf *bufs[BURST_SIZE];
 	uint64_t tx_total = 0;
+	uint64_t post_warmup_sent = 0;  /* sent after warmup, i.e. during the timed window */
 	uint64_t packet_index = ctx->packet_index;
 	uint64_t start_tsc;
 	uint64_t last_print = rte_rdtsc();
@@ -1060,9 +1087,10 @@ static int tx_loop(void *arg)
 		       pr_lambda);
 
 	while (keep_running) {
-		if (test_mode && (rte_rdtsc() - start_tsc) >= (10 * hz)) {
+		if (test_mode && (rte_rdtsc() - start_tsc) >= (TEST_DURATION_SEC * hz)) {
 			if (!quiet_mode)
-				printf("[TEST] 10 second run completed, stopping traffic\n");
+				printf("[TEST] %d second run completed, stopping traffic\n",
+				       TEST_DURATION_SEC);
 			keep_running = 0;
 			break;
 		}
@@ -1090,6 +1118,7 @@ static int tx_loop(void *arg)
 			for (uint16_t j = sent; j < burst; j++)
 				rte_pktmbuf_free(bufs[j]);
 			tx_total   += sent;
+			post_warmup_sent += sent;
 			pb_remaining -= burst;
 			goto stats;
 		}
@@ -1134,6 +1163,7 @@ static int tx_loop(void *arg)
 			for (uint16_t j = sent; j < burst; j++)
 				rte_pktmbuf_free(bufs[j]);
 			tx_total += sent;
+			post_warmup_sent += sent;
 			pr_sent_this_interval += sent;
 			goto stats;
 		}
@@ -1159,6 +1189,7 @@ static int tx_loop(void *arg)
 		for (uint16_t j = sent; j < BURST_SIZE; j++)
 			rte_pktmbuf_free(bufs[j]);
 		tx_total += sent;
+		post_warmup_sent += sent;
 
 stats:
 		/* Print a summary every second */
@@ -1177,6 +1208,7 @@ stats:
 		printf("[TX] q%u total packets sent: %" PRIu64 "\n",
 		       ctx->queue_id, tx_total);
 	ctx->tx_total = tx_total;
+	ctx->tx_post_warmup = post_warmup_sent;
 	return 0;
 }
 
@@ -1201,8 +1233,9 @@ static void usage(const char *prog)
 	       "                    no traffic for the rest of the window.\n"
 	       "  --poisson-rate    Re-sample TX rate every %u us from Poisson(mean=%llu pps);\n"
 	       "                    packets are paced evenly across each interval.\n"
-	       "  --quiet   Suppress all output except the final \"[STATS] Packet diff\" "
-	       "line and the SUCCESS/FAIL line right after it.\n",
+	       "  --quiet   Suppress all output except the final \"[STATS] Packet diff\", "
+	       "\"[STATS] Average received throughput\", \"[STATS] Average sending "
+	       "throughput\" and SUCCESS/FAIL lines.\n",
 	       prog,
 	       (unsigned int)TINY_KEY_SIZE, (unsigned int)TINY_VALUE_SIZE,
 	       (unsigned int)SMALL_KEY_SIZE, (unsigned int)SMALL_VALUE_SIZE,
@@ -1402,11 +1435,25 @@ int main(int argc, char *argv[])
 	if (nb_rx_queues > MAX_RX_QUEUES)
 		nb_rx_queues = MAX_RX_QUEUES;
 
+	/* Allocate mbuf pools on the NIC's own NUMA node rather than the
+	 * calling (main) lcore's node -- otherwise every TX/RX descriptor
+	 * fetch and DMA can end up crossing sockets on multi-node systems. */
+	int pool_socket_id = rte_eth_dev_socket_id(port_id);
+	if (pool_socket_id == SOCKET_ID_ANY) {
+		if (!quiet_mode)
+			printf("Warning: port %u reports no NUMA affinity, "
+			       "using calling lcore's socket for mbuf pools\n", port_id);
+		pool_socket_id = (int)rte_socket_id();
+	}
+	if (!quiet_mode)
+		printf("Allocating mbuf pools on socket %d (port %u's NUMA node)\n",
+		       pool_socket_id, port_id);
+
 	/* --- Create RX/TX mbuf pools --- */
 	rx_mbuf_pool = rte_pktmbuf_pool_create("RX_MBUF_POOL", NUM_MBUFS * nb_ports,
 						MBUF_CACHE, 0,
 						RTE_MBUF_DEFAULT_BUF_SIZE,
-						rte_socket_id());
+						pool_socket_id);
 	if (rx_mbuf_pool == NULL)
 		rte_exit(EXIT_FAILURE, "Cannot create RX mbuf pool: %s\n",
 			 rte_strerror(rte_errno));
@@ -1414,7 +1461,7 @@ int main(int argc, char *argv[])
 	tx_mbuf_pool = rte_pktmbuf_pool_create("TX_MBUF_POOL", NUM_MBUFS * nb_ports,
 						MBUF_CACHE, 0,
 						RTE_MBUF_DEFAULT_BUF_SIZE,
-						rte_socket_id());
+						pool_socket_id);
 	if (tx_mbuf_pool == NULL)
 		rte_exit(EXIT_FAILURE, "Cannot create TX mbuf pool: %s\n",
 			 rte_strerror(rte_errno));
@@ -1515,13 +1562,42 @@ int main(int argc, char *argv[])
 
 	/* --- Merge per-lcore TX stats into globals --- */
 	tx_total_global = 0;
-	for (uint16_t i = 0; i < nb_tx_lcores; i++)
+	tx_post_warmup_global = 0;
+	for (uint16_t i = 0; i < nb_tx_lcores; i++) {
 		tx_total_global += tx_ctxs[i].tx_total;
+		tx_post_warmup_global += tx_ctxs[i].tx_post_warmup;
+	}
 
 	printf("[STATS] Packet diff (sent - received): %" PRId64
 	       "  (sent=%" PRIu64 " received=%" PRIu64 ")\n",
 	       (int64_t)tx_total_global - (int64_t)rx_total_global,
 	       tx_total_global, rx_total_global);
+
+	{
+		/* Average received throughput over the run's timed window
+		 * (the fixed TEST_DURATION_SEC-second window in --test mode).
+		 * Frame size is averaged across the GET/SET mix (mica_get_pct). */
+		double elapsed_sec = (double)TEST_DURATION_SEC;
+		double avg_frame_len = (mica_get_pct / 100.0) * mica_get_frame_len +
+					(1.0 - mica_get_pct / 100.0) * mica_set_frame_len;
+		double rx_mpps = (double)rx_total_global / elapsed_sec / 1e6;
+		double rx_gbps = (double)rx_total_global * avg_frame_len * 8.0 /
+				  elapsed_sec / 1e9;
+
+		printf("[STATS] Average received throughput: %.3f Mpps  (%.3f Gbps, "
+		       "avg %.1f-byte frames, %.0fs window)\n",
+		       rx_mpps, rx_gbps, avg_frame_len, elapsed_sec);
+
+		/* Average sending throughput over the same window, excluding
+		 * the warmup packets sent before the timed window started. */
+		double tx_mpps = (double)tx_post_warmup_global / elapsed_sec / 1e6;
+		double tx_gbps = (double)tx_post_warmup_global * avg_frame_len * 8.0 /
+				  elapsed_sec / 1e9;
+
+		printf("[STATS] Average sending throughput: %.3f Mpps  (%.3f Gbps, "
+		       "avg %.1f-byte frames, %.0fs window)\n",
+		       tx_mpps, tx_gbps, avg_frame_len, elapsed_sec);
+	}
 
 	{
 		uint64_t sent = tx_total_global;
